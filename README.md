@@ -28,22 +28,24 @@
 
 不支持 Docker、Nginx Proxy Manager、宝塔中的定制 Nginx 和 Kubernetes。OpenResty 配置可以导出，但恢复前需要自行安装兼容的 OpenResty 版本。
 
-## 安装
+## 下载并运行
 
 推荐先下载再执行，便于检查脚本内容：
 
 ```bash
-sudo curl -fL \
+curl -fL \
   https://raw.githubusercontent.com/sanrokamlan-prog/nginx-easy-deploy/main/nginx-easy-deploy.sh \
-  -o /usr/local/sbin/nginx-easy-deploy
-sudo chmod +x /usr/local/sbin/nginx-easy-deploy
-sudo nginx-easy-deploy
+  -o nginx-easy-deploy.sh
+sudo bash nginx-easy-deploy.sh
 ```
 
-直接运行且不带参数时，会打开中文菜单：
+脚本不带参数运行时会打开中文菜单，不会安装或常驻一个管理程序。
+
+希望以后直接输入 `nginx-easy-deploy` 时，可以自行复制到 PATH；这只是可选快捷方式：
 
 ```bash
-sudo bash nginx-easy-deploy.sh
+sudo install -m 755 nginx-easy-deploy.sh /usr/local/sbin/nginx-easy-deploy
+sudo nginx-easy-deploy
 ```
 
 ## 命令行用法
@@ -51,40 +53,40 @@ sudo bash nginx-easy-deploy.sh
 安装 Nginx 和 Certbot：
 
 ```bash
-sudo nginx-easy-deploy install
+sudo bash nginx-easy-deploy.sh install
 ```
 
 反向代理本机 `3000` 端口并申请 HTTPS：
 
 ```bash
-sudo nginx-easy-deploy proxy app.example.com 3000 \
+sudo bash nginx-easy-deploy.sh proxy app.example.com 3000 \
   --email you@example.com
 ```
 
 也可以填写完整上游地址：
 
 ```bash
-sudo nginx-easy-deploy proxy app.example.com http://127.0.0.1:3000 \
+sudo bash nginx-easy-deploy.sh proxy app.example.com http://127.0.0.1:3000 \
   --email you@example.com
 ```
 
 部署静态网站：
 
 ```bash
-sudo nginx-easy-deploy static example.com /var/www/example.com \
+sudo bash nginx-easy-deploy.sh static example.com /var/www/example.com \
   --email you@example.com
 ```
 
 只部署 HTTP：
 
 ```bash
-sudo nginx-easy-deploy proxy app.example.com 3000 --no-ssl
+sudo bash nginx-easy-deploy.sh proxy app.example.com 3000 --no-ssl
 ```
 
 以后再启用 Let's Encrypt：
 
 ```bash
-sudo nginx-easy-deploy ssl app.example.com you@example.com
+sudo bash nginx-easy-deploy.sh ssl app.example.com you@example.com
 ```
 
 ## 自有证书
@@ -92,7 +94,7 @@ sudo nginx-easy-deploy ssl app.example.com you@example.com
 上传 `fullchain.pem` 和 `privkey.pem` 到服务器后执行：
 
 ```bash
-sudo nginx-easy-deploy cert example.com \
+sudo bash nginx-easy-deploy.sh cert example.com \
   /root/certs/fullchain.pem \
   /root/certs/privkey.pem
 ```
@@ -100,7 +102,7 @@ sudo nginx-easy-deploy cert example.com \
 证书和中间证书链是两个文件时：
 
 ```bash
-sudo nginx-easy-deploy cert example.com \
+sudo bash nginx-easy-deploy.sh cert example.com \
   /root/certs/cert.pem \
   /root/certs/privkey.pem \
   --chain /root/certs/chain.pem
@@ -113,7 +115,7 @@ sudo nginx-easy-deploy cert example.com \
 旧服务器执行：
 
 ```bash
-sudo nginx-easy-deploy export --encrypt
+sudo bash nginx-easy-deploy.sh export --encrypt
 ```
 
 上传生成的 `.tar.gz.enc` 文件和本脚本到新服务器，然后执行：
@@ -133,13 +135,13 @@ sudo bash nginx-easy-deploy.sh restore ngx-migrate-host-date.tar.gz.enc
 静态站点文件默认不会打包。需要一起迁移时：
 
 ```bash
-sudo nginx-easy-deploy export --encrypt --with-webroot
+sudo bash nginx-easy-deploy.sh export --encrypt --with-webroot
 ```
 
 也可以额外指定目录：
 
 ```bash
-sudo nginx-easy-deploy export --encrypt --include /srv/my-site
+sudo bash nginx-easy-deploy.sh export --encrypt --include /srv/my-site
 ```
 
 恢复时会先把新机现有文件保存到：
@@ -153,11 +155,11 @@ sudo nginx-easy-deploy export --encrypt --include /srv/my-site
 ## 其他管理命令
 
 ```bash
-sudo nginx-easy-deploy sites
-sudo nginx-easy-deploy status
-sudo nginx-easy-deploy renew
-sudo nginx-easy-deploy delete example.com
-sudo nginx-easy-deploy delete example.com --delete-cert
+sudo bash nginx-easy-deploy.sh sites
+sudo bash nginx-easy-deploy.sh status
+sudo bash nginx-easy-deploy.sh renew
+sudo bash nginx-easy-deploy.sh delete example.com
+sudo bash nginx-easy-deploy.sh delete example.com --delete-cert
 ```
 
 ## 迁移注意事项
