@@ -1,0 +1,5 @@
+ngx-migrate-*.tar.gz
+ngx-migrate-*.tar.gz.enc
+*.pem
+*.key
+*.crt
