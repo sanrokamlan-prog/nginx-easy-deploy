@@ -4,7 +4,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="${0##*/}"
 WORK_DIR=""
 CHANGES_STARTED=0
@@ -30,10 +30,16 @@ nginx-easy-deploy v${VERSION} - 原生 Nginx 一键部署与迁移
   sudo bash ${PROGRAM} static example.com /var/www/example.com --email you@example.com
   sudo bash ${PROGRAM} cert example.com fullchain.pem privkey.pem
   sudo bash ${PROGRAM} cert example.com cert.pem privkey.pem --chain chain.pem
+  sudo bash ${PROGRAM} dns-ssl example.com you@example.com cloudflare.ini --wildcard
+  sudo bash ${PROGRAM} doctor [example.com]
+  sudo bash ${PROGRAM} certs
+  sudo bash ${PROGRAM} cf-realip [--schedule]
+  sudo bash ${PROGRAM} tune [--bbr]
+  sudo bash ${PROGRAM} update
   sudo bash ${PROGRAM} sites
   sudo bash ${PROGRAM} status
   sudo bash ${PROGRAM} renew
-  sudo bash ${PROGRAM} delete example.com
+  sudo bash ${PROGRAM} delete example.com [--delete-cert] [--backup-files]
 
 旧服务器导出：
   sudo bash ${PROGRAM} export
@@ -50,6 +56,19 @@ nginx-easy-deploy v${VERSION} - 原生 Nginx 一键部署与迁移
   --email ADDRESS       申请 Let's Encrypt 证书使用的邮箱
   --no-ssl              只部署 HTTP
   --force               覆盖脚本已管理的同名站点
+
+Cloudflare DNS 证书：
+  dns-ssl DOMAIN EMAIL CREDENTIALS_FILE [--wildcard] [--staging]
+  CREDENTIALS_FILE 内容：dns_cloudflare_api_token = YOUR_TOKEN
+  Token 只需目标区域的 Zone:DNS:Edit 权限
+
+运维选项：
+  cf-realip             更新 Cloudflare 真实访客 IP 配置
+  cf-realip --schedule  更新并安装每周自动更新任务（非守护进程）
+  cf-realip --remove    删除脚本管理的 Cloudflare 配置和任务
+  tune [--bbr]           保守调优；BBR 仅在明确添加选项时启用
+  tune --restore latest  恢复最近一次调优前的设置
+  update                 备份后使用系统软件源更新 Nginx
 
 迁移选项：
   -o, --output FILE     指定导出文件
@@ -398,6 +417,31 @@ install_certbot() {
 
     command -v certbot >/dev/null 2>&1 \
         && certbot plugins 2>/dev/null | grep -q 'nginx'
+}
+
+install_cloudflare_certbot() {
+    install_certbot || return 1
+    if certbot plugins 2>/dev/null | grep -q 'dns-cloudflare'; then
+        return 0
+    fi
+
+    log "正在安装 Certbot Cloudflare DNS 插件。"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-certbot-dns-cloudflare
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y python3-certbot-dns-cloudflare
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y python3-certbot-dns-cloudflare
+    elif command -v apk >/dev/null 2>&1; then
+        apk add certbot-dns-cloudflare
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install python3-certbot-dns-cloudflare
+    else
+        return 1
+    fi
+
+    certbot plugins 2>/dev/null | grep -q 'dns-cloudflare'
 }
 
 open_firewall_ports() {
@@ -857,11 +901,12 @@ list_sites() {
 }
 
 delete_site() {
-    local domain="${1:-}" delete_cert=0
+    local domain="${1:-}" delete_cert=0 backup_files=0
     shift || true
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --delete-cert) delete_cert=1; shift ;;
+            --backup-files) backup_files=1; shift ;;
             *) die "未知删除选项: $1" ;;
         esac
     done
@@ -873,6 +918,7 @@ delete_site() {
     [[ -f "${config}" ]] || die "站点不存在: ${domain}"
     grep -Fq '# Managed by nginx-easy-deploy.' "${config}" \
         || die "该文件不是脚本创建的，拒绝自动删除: ${config}"
+    backup_site "${domain}" "${config}" "${backup_files}"
     backup="$(mktemp /tmp/ngx-easy-delete-backup.XXXXXX)"
     cp -a "${config}" "${backup}"
     rm -f "${config}"
@@ -889,6 +935,37 @@ delete_site() {
         rm -rf -- "/etc/nginx/ssl/${domain}"
     fi
     log "站点已删除: ${domain}"
+}
+
+backup_site() {
+    local domain="$1" config="$2" include_files="${3:-0}"
+    local timestamp backup_dir item webroot=""
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="/var/backups/nginx-easy-deploy/sites/${domain}-${timestamp}"
+    mkdir -p "${backup_dir}/rootfs"
+
+    local -a items=("${config}")
+    [[ -d "/etc/nginx/ssl/${domain}" ]] && items+=("/etc/nginx/ssl/${domain}")
+    [[ -d "/etc/letsencrypt/live/${domain}" ]] && items+=("/etc/letsencrypt/live/${domain}")
+    [[ -d "/etc/letsencrypt/archive/${domain}" ]] && items+=("/etc/letsencrypt/archive/${domain}")
+    [[ -f "/etc/letsencrypt/renewal/${domain}.conf" ]] && items+=("/etc/letsencrypt/renewal/${domain}.conf")
+
+    if [[ "${include_files}" -eq 1 ]]; then
+        webroot="$(awk '$1 == "root" {gsub(/;$/, "", $2); print $2; exit}' "${config}")"
+        if [[ -n "${webroot}" ]] && validate_static_root "${webroot}" \
+            && [[ -d "${webroot}" ]]; then
+            items+=("${webroot}")
+        fi
+    fi
+
+    for item in "${items[@]}"; do
+        cp -a --parents -- "${item}" "${backup_dir}/rootfs"
+    done
+    printf 'domain\t%s\ncreated_utc\t%s\ninclude_files\t%s\n' \
+        "${domain}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${include_files}" \
+        > "${backup_dir}/metadata.tsv"
+    chmod -R go-rwx "${backup_dir}"
+    log "站点备份已保存: ${backup_dir}"
 }
 
 renew_certificates() {
@@ -918,6 +995,525 @@ show_status() {
     else
         warn "Certbot 尚未安装。"
     fi
+}
+
+certificate_days_left() {
+    local cert_file="$1" end_date end_epoch now_epoch delta
+    end_date="$(openssl x509 -in "${cert_file}" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+    [[ -n "${end_date}" ]] || return 1
+    end_epoch="$(date -d "${end_date}" +%s 2>/dev/null)" || return 1
+    now_epoch="$(date -u +%s)"
+    delta=$((end_epoch - now_epoch))
+    if (( delta < 0 )); then
+        printf '%s\n' "$(( -((-delta + 86399) / 86400) ))"
+    else
+        printf '%s\n' "$(( delta / 86400 ))"
+    fi
+}
+
+check_certificates() {
+    [[ $# -eq 0 ]] || die "用法: ${PROGRAM} certs"
+    require_root
+    require_command openssl
+    command -v nginx >/dev/null 2>&1 || die "Nginx 尚未安装。"
+    local dump path end_date days status found=0
+    dump="$(nginx -T 2>&1 || true)"
+    printf '%-7s %-8s %-24s %s\n' "STATUS" "DAYS" "EXPIRES" "CERTIFICATE"
+    printf '%-7s %-8s %-24s %s\n' "------" "----" "-------" "-----------"
+    while IFS= read -r path; do
+        [[ -f "${path}" ]] || continue
+        found=1
+        end_date="$(openssl x509 -in "${path}" -noout -enddate 2>/dev/null | cut -d= -f2- || true)"
+        days="$(certificate_days_left "${path}" 2>/dev/null || true)"
+        if [[ -z "${days}" ]]; then
+            status="ERROR"
+            days="-"
+        elif (( days < 0 )); then
+            status="EXPIRED"
+        elif (( days <= 7 )); then
+            status="URGENT"
+        elif (( days <= 30 )); then
+            status="WARN"
+        else
+            status="OK"
+        fi
+        printf '%-7s %-8s %-24s %s\n' "${status}" "${days}" "${end_date:--}" "${path}"
+    done < <(
+        printf '%s\n' "${dump}" \
+            | awk '$1 == "ssl_certificate" {value=$2; sub(/;$/, "", value); if (value ~ /^\// && value !~ /\$/) print value}' \
+            | sort -u
+    )
+    [[ "${found}" -eq 1 ]] || log "没有发现 Nginx 正在使用的本地证书。"
+}
+
+detect_public_ipv4() {
+    local service result
+    command -v curl >/dev/null 2>&1 || return 1
+    for service in \
+        https://api.ipify.org \
+        https://checkip.amazonaws.com \
+        https://icanhazip.com; do
+        result="$(curl -4fsS --connect-timeout 2 --max-time 4 "${service}" 2>/dev/null | tr -d '\r\n ' || true)"
+        if [[ "${result}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            printf '%s\n' "${result}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+doctor() {
+    [[ $# -le 1 ]] || die "用法: ${PROGRAM} doctor [DOMAIN]"
+    local domain="${1:-}" os_id="unknown" os_version="unknown"
+    local public_ip="unknown" local_ips="unknown" memory_mb="unknown" cpu_count="unknown"
+    if [[ -r /etc/os-release ]]; then
+        os_id="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '\"')"
+        os_version="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n1 | tr -d '\"')"
+    fi
+    command -v nproc >/dev/null 2>&1 && cpu_count="$(nproc)"
+    [[ -r /proc/meminfo ]] && memory_mb="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)"
+    command -v hostname >/dev/null 2>&1 && local_ips="$(hostname -I 2>/dev/null | xargs || true)"
+    public_ip="$(detect_public_ipv4 2>/dev/null || printf unknown)"
+
+    log "环境诊断"
+    printf '  %-16s %s %s\n' "OS" "${os_id}" "${os_version}"
+    printf '  %-16s %s\n' "CPU" "${cpu_count}"
+    printf '  %-16s %s MB\n' "Memory" "${memory_mb}"
+    printf '  %-16s %s\n' "Local IPv4" "${local_ips:-unknown}"
+    printf '  %-16s %s\n' "Public IPv4" "${public_ip}"
+
+    if command -v nginx >/dev/null 2>&1; then
+        printf '  %-16s %s\n' "Nginx" "$(nginx -v 2>&1)"
+        if nginx -t >/dev/null 2>&1; then
+            printf '  %-16s %s\n' "Config" "OK"
+        else
+            printf '  %-16s %s\n' "Config" "FAILED"
+            nginx -t || true
+        fi
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
+            printf '  %-16s %s\n' "Service" "running"
+        else
+            printf '  %-16s %s\n' "Service" "stopped or unknown"
+        fi
+    else
+        printf '  %-16s %s\n' "Nginx" "not installed"
+    fi
+
+    if command -v ss >/dev/null 2>&1; then
+        log "80/443 端口监听"
+        ss -ltnp 2>/dev/null | awk 'NR == 1 || $4 ~ /:80$|:443$/' || true
+    fi
+
+    if [[ -n "${domain}" ]]; then
+        validate_domain "${domain}" || die "域名格式不正确: ${domain}"
+        log "域名诊断: ${domain}"
+        local resolved=""
+        if command -v getent >/dev/null 2>&1; then
+            resolved="$(getent ahostsv4 "${domain}" 2>/dev/null | awk '{print $1}' | sort -u | xargs || true)"
+        fi
+        printf '  %-16s %s\n' "DNS IPv4" "${resolved:-unresolved}"
+        if [[ "${public_ip}" != "unknown" && -n "${resolved}" ]]; then
+            if printf '%s\n' "${resolved}" | tr ' ' '\n' | grep -Fxq "${public_ip}"; then
+                printf '  %-16s %s\n' "DNS Match" "yes"
+            else
+                printf '  %-16s %s\n' "DNS Match" "no (CDN/NAT may be intentional)"
+            fi
+        fi
+    fi
+}
+
+validate_cloudflare_ranges() {
+    local file="$1" family="$2" line count=0
+    [[ -s "${file}" ]] || return 1
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line//$'\r'/}"
+        [[ -n "${line}" ]] || continue
+        if [[ "${family}" == "4" ]]; then
+            [[ "${line}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] || return 1
+        else
+            [[ "${line}" =~ ^[0-9A-Fa-f:]+/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || return 1
+        fi
+        count=$((count + 1))
+    done < "${file}"
+    (( count >= 5 ))
+}
+
+write_cloudflare_realip_config() {
+    local output="$1" ipv4_file="$2" ipv6_file="$3" range
+    {
+        printf '%s\n' '# Managed by nginx-easy-deploy.'
+        printf '%s\n' '# Source: https://www.cloudflare.com/ips/'
+        printf '%s\n' 'real_ip_header CF-Connecting-IP;'
+        printf '%s\n' 'real_ip_recursive on;'
+        while IFS= read -r range || [[ -n "${range}" ]]; do
+            range="${range//$'\r'/}"
+            [[ -n "${range}" ]] && printf 'set_real_ip_from %s;\n' "${range}"
+        done < "${ipv4_file}"
+        while IFS= read -r range || [[ -n "${range}" ]]; do
+            range="${range//$'\r'/}"
+            [[ -n "${range}" ]] && printf 'set_real_ip_from %s;\n' "${range}"
+        done < "${ipv6_file}"
+    } > "${output}"
+}
+
+install_cloudflare_schedule() {
+    local script_source script_copy cron_script
+    script_source="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    [[ -f "${script_source}" ]] || die "无法定位当前脚本，不能安装自动更新任务。"
+    script_copy="/usr/local/libexec/nginx-easy-cloudflare-realip.sh"
+    cron_script="/etc/cron.weekly/nginx-easy-cloudflare-realip"
+    mkdir -p /usr/local/libexec /etc/cron.weekly
+    install -m 700 "${script_source}" "${script_copy}"
+    cat > "${cron_script}" <<EOF
+#!/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+exec /usr/bin/env bash ${script_copy} cf-realip
+EOF
+    chmod 700 "${cron_script}"
+    log "已安装每周 Cloudflare IP 更新任务: ${cron_script}"
+}
+
+cloudflare_realip() {
+    local schedule=0 remove=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --schedule) schedule=1; shift ;;
+            --remove) remove=1; shift ;;
+            *) die "未知 Cloudflare 真实 IP 选项: $1" ;;
+        esac
+    done
+
+    require_root
+    command -v nginx >/dev/null 2>&1 || die "Nginx 尚未安装。"
+    ensure_managed_config_dir
+    local config="${MANAGED_CONFIG_DIR}/00-ngx-easy-cloudflare-realip.conf"
+    local backup_dir timestamp backup=""
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="/var/backups/nginx-easy-deploy/cloudflare-realip"
+    mkdir -p "${backup_dir}"
+    if [[ -f "${config}" ]]; then
+        backup="${backup_dir}/cloudflare-realip-${timestamp}.conf"
+        cp -a "${config}" "${backup}"
+    fi
+
+    if [[ "${remove}" -eq 1 ]]; then
+        rm -f "${config}" \
+            /etc/cron.weekly/nginx-easy-cloudflare-realip \
+            /usr/local/libexec/nginx-easy-cloudflare-realip.sh
+        if ! nginx -t; then
+            [[ -n "${backup}" ]] && cp -a "${backup}" "${config}"
+            die "删除 Cloudflare 真实 IP 配置后校验失败，已恢复。"
+        fi
+        reload_nginx
+        log "已删除脚本管理的 Cloudflare 真实 IP 配置和自动任务。"
+        return 0
+    fi
+
+    require_command curl
+    local work ipv4_file ipv6_file temp
+    work="$(mktemp -d /tmp/ngx-easy-cloudflare.XXXXXX)"
+    ipv4_file="${work}/ips-v4"
+    ipv6_file="${work}/ips-v6"
+    curl -fsSL --retry 3 --connect-timeout 5 --max-time 30 \
+        https://www.cloudflare.com/ips-v4/ -o "${ipv4_file}"
+    curl -fsSL --retry 3 --connect-timeout 5 --max-time 30 \
+        https://www.cloudflare.com/ips-v6/ -o "${ipv6_file}"
+    validate_cloudflare_ranges "${ipv4_file}" 4 \
+        || { rm -rf "${work}"; die "Cloudflare IPv4 列表校验失败，未修改配置。"; }
+    validate_cloudflare_ranges "${ipv6_file}" 6 \
+        || { rm -rf "${work}"; die "Cloudflare IPv6 列表校验失败，未修改配置。"; }
+
+    temp="$(mktemp "${MANAGED_CONFIG_DIR}/.ngx-easy-cloudflare.XXXXXX")"
+    write_cloudflare_realip_config "${temp}" "${ipv4_file}" "${ipv6_file}"
+    chmod 644 "${temp}"
+    mv -f "${temp}" "${config}"
+    if ! nginx -t; then
+        if [[ -n "${backup}" ]]; then
+            cp -a "${backup}" "${config}"
+        else
+            rm -f "${config}"
+        fi
+        rm -rf "${work}"
+        die "Cloudflare 真实 IP 配置校验失败，已恢复原配置。"
+    fi
+    reload_nginx
+    rm -rf "${work}"
+    log "Cloudflare 真实访客 IP 配置已更新。"
+    [[ "${schedule}" -eq 1 ]] && install_cloudflare_schedule
+}
+
+install_certbot_reload_hook() {
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    local hook="${hook_dir}/nginx-easy-reload"
+    mkdir -p "${hook_dir}"
+    cat > "${hook}" <<'EOF'
+#!/bin/sh
+nginx -t || exit 1
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
+    exec systemctl reload nginx
+fi
+exec nginx -s reload
+EOF
+    chmod 755 "${hook}"
+}
+
+enable_cloudflare_dns_https() {
+    [[ $# -ge 3 ]] || die "用法: ${PROGRAM} dns-ssl DOMAIN EMAIL CREDENTIALS_FILE [--wildcard] [--staging]"
+    local domain="$1" email="$2" credentials_source="$3"
+    shift 3
+    local wildcard=0 staging=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --wildcard) wildcard=1; shift ;;
+            --staging) staging=1; shift ;;
+            *) die "未知 DNS 证书选项: $1" ;;
+        esac
+    done
+
+    require_root
+    domain="$(printf '%s' "${domain}" | tr 'A-Z' 'a-z')"
+    validate_domain "${domain}" || die "域名格式不正确: ${domain}"
+    validate_email "${email}" || die "邮箱格式不正确: ${email}"
+    [[ -f "${credentials_source}" && -r "${credentials_source}" ]] \
+        || die "Cloudflare 凭据文件不可读: ${credentials_source}"
+    local token
+    token="$(awk -F= '
+        /^[[:space:]]*dns_cloudflare_api_token[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, ""); gsub(/[[:space:]\r]+$/, ""); print; exit
+        }
+    ' "${credentials_source}")"
+    [[ "${token}" =~ ^[A-Za-z0-9_-]{20,}$ ]] \
+        || die "凭据文件中缺少有效的 dns_cloudflare_api_token。"
+
+    command -v nginx >/dev/null 2>&1 || install_nginx nginx
+    ensure_managed_config_dir
+    local config
+    config="$(site_config_path "${domain}")"
+    [[ -f "${config}" ]] || die "没有找到脚本管理的站点: ${domain}"
+    install_cloudflare_certbot \
+        || die "Certbot Cloudflare DNS 插件安装失败，请检查系统软件源。"
+
+    local credentials_dir="/etc/letsencrypt/cloudflare"
+    local credentials="${credentials_dir}/${domain}.ini" temp_credentials
+    mkdir -p "${credentials_dir}"
+    chmod 700 "${credentials_dir}"
+    temp_credentials="$(mktemp "${credentials_dir}/.credentials.XXXXXX")"
+    printf 'dns_cloudflare_api_token = %s\n' "${token}" > "${temp_credentials}"
+    chmod 600 "${temp_credentials}"
+    mv -f "${temp_credentials}" "${credentials}"
+    install_certbot_reload_hook
+    backup_site "${domain}" "${config}" 0
+
+    local -a args=(
+        run
+        --authenticator dns-cloudflare
+        --installer nginx
+        --dns-cloudflare-credentials "${credentials}"
+        --dns-cloudflare-propagation-seconds 30
+        --non-interactive
+        --agree-tos
+        --no-eff-email
+        --redirect
+        --email "${email}"
+        --cert-name "${domain}"
+        --domains "${domain}"
+    )
+    if [[ "${wildcard}" -eq 1 ]]; then
+        args+=(--domains "*.${domain}")
+        [[ -d "/etc/letsencrypt/live/${domain}" ]] && args+=(--expand)
+    fi
+    [[ "${staging}" -eq 1 ]] && args+=(--staging)
+
+    log "正在通过 Cloudflare DNS 为 ${domain} 申请并安装证书。"
+    certbot "${args[@]}"
+    reload_nginx
+    log "Cloudflare DNS 证书已启用: https://${domain}"
+    [[ "${wildcard}" -eq 1 ]] && log "证书同时包含: *.${domain}"
+    [[ "${staging}" -eq 1 ]] && warn "当前使用 Let's Encrypt 测试环境，浏览器不会信任该证书。"
+}
+
+restore_tuning() {
+    local backup_dir="$1"
+    if [[ "${backup_dir}" == "latest" ]]; then
+        backup_dir="$(find /var/backups/nginx-easy-deploy -maxdepth 1 -type d -name 'tuning-*' 2>/dev/null | sort | tail -n 1)"
+    fi
+    [[ -n "${backup_dir}" && -f "${backup_dir}/metadata.tsv" ]] \
+        || die "找不到有效的调优备份: ${backup_dir:-latest}"
+    [[ "$(metadata_value "${backup_dir}/metadata.tsv" format_version)" == "1" ]] \
+        || die "不支持的调优备份格式。"
+
+    local sysctl_file="/etc/sysctl.d/99-nginx-easy.conf"
+    local limits_file="/etc/systemd/system/nginx.service.d/99-nginx-easy-limits.conf"
+    local state key value
+    state="$(metadata_value "${backup_dir}/metadata.tsv" sysctl_file)"
+    if [[ "${state}" == "present" ]]; then
+        mkdir -p "$(dirname "${sysctl_file}")"
+        cp -a "${backup_dir}/rootfs${sysctl_file}" "${sysctl_file}"
+    else
+        rm -f "${sysctl_file}"
+    fi
+    state="$(metadata_value "${backup_dir}/metadata.tsv" limits_file)"
+    if [[ "${state}" == "present" ]]; then
+        mkdir -p "$(dirname "${limits_file}")"
+        cp -a "${backup_dir}/rootfs${limits_file}" "${limits_file}"
+    else
+        rm -f "${limits_file}"
+    fi
+
+    while IFS=$'\t' read -r key value; do
+        case "${key}" in
+            net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|net.ipv4.tcp_syncookies|fs.file-max|net.core.default_qdisc|net.ipv4.tcp_congestion_control)
+                sysctl -w "${key}=${value}" >/dev/null || warn "无法恢复内核参数: ${key}"
+                ;;
+        esac
+    done < "${backup_dir}/sysctl-original.tsv"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+        if command -v nginx >/dev/null 2>&1 && systemctl cat nginx >/dev/null 2>&1; then
+            nginx -t
+            systemctl restart nginx
+        fi
+    fi
+    log "已恢复调优前设置: ${backup_dir}"
+}
+
+tune_nginx() {
+    require_root
+    if [[ "${1:-}" == "--restore" ]]; then
+        [[ $# -eq 2 ]] || die "用法: ${PROGRAM} tune --restore latest|BACKUP_DIR"
+        restore_tuning "$2"
+        return 0
+    fi
+    local enable_bbr=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --bbr) enable_bbr=1; shift ;;
+            *) die "未知调优选项: $1" ;;
+        esac
+    done
+    require_command sysctl
+
+    local timestamp backup_dir sysctl_file limits_file temp key value
+    local somaxconn syn_backlog file_max nofile_limit current_nofile
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="/var/backups/nginx-easy-deploy/tuning-${timestamp}"
+    sysctl_file="/etc/sysctl.d/99-nginx-easy.conf"
+    limits_file="/etc/systemd/system/nginx.service.d/99-nginx-easy-limits.conf"
+    mkdir -p "${backup_dir}/rootfs"
+    printf 'format_version\t1\n' > "${backup_dir}/metadata.tsv"
+    if [[ -f "${sysctl_file}" ]]; then
+        printf 'sysctl_file\tpresent\n' >> "${backup_dir}/metadata.tsv"
+        cp -a --parents "${sysctl_file}" "${backup_dir}/rootfs"
+    else
+        printf 'sysctl_file\tabsent\n' >> "${backup_dir}/metadata.tsv"
+    fi
+    if [[ -f "${limits_file}" ]]; then
+        printf 'limits_file\tpresent\n' >> "${backup_dir}/metadata.tsv"
+        cp -a --parents "${limits_file}" "${backup_dir}/rootfs"
+    else
+        printf 'limits_file\tabsent\n' >> "${backup_dir}/metadata.tsv"
+    fi
+
+    : > "${backup_dir}/sysctl-original.tsv"
+    for key in net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_syncookies fs.file-max net.core.default_qdisc net.ipv4.tcp_congestion_control; do
+        value="$(sysctl -n "${key}" 2>/dev/null || true)"
+        [[ -n "${value}" ]] && printf '%s\t%s\n' "${key}" "${value}" >> "${backup_dir}/sysctl-original.tsv"
+    done
+    chmod -R go-rwx "${backup_dir}"
+
+    somaxconn="$(sysctl -n net.core.somaxconn 2>/dev/null || printf 0)"
+    syn_backlog="$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || printf 0)"
+    file_max="$(sysctl -n fs.file-max 2>/dev/null || printf 0)"
+    [[ "${somaxconn}" =~ ^[0-9]+$ ]] || somaxconn=0
+    [[ "${syn_backlog}" =~ ^[0-9]+$ ]] || syn_backlog=0
+    [[ "${file_max}" =~ ^[0-9]+$ ]] || file_max=0
+    (( somaxconn < 4096 )) && somaxconn=4096
+    (( syn_backlog < 4096 )) && syn_backlog=4096
+    (( file_max < 262144 )) && file_max=262144
+    nofile_limit=65535
+    if command -v systemctl >/dev/null 2>&1; then
+        current_nofile="$(systemctl show nginx -p LimitNOFILE --value 2>/dev/null || true)"
+        if [[ "${current_nofile}" == "infinity" ]]; then
+            nofile_limit="infinity"
+        elif [[ "${current_nofile}" =~ ^[0-9]+$ ]] \
+            && (( current_nofile > nofile_limit )); then
+            nofile_limit="${current_nofile}"
+        fi
+    fi
+
+    temp="$(mktemp /tmp/ngx-easy-sysctl.XXXXXX)"
+    {
+        printf '%s\n' '# Managed by nginx-easy-deploy. Restore with: tune --restore latest'
+        printf 'net.core.somaxconn = %s\n' "${somaxconn}"
+        printf 'net.ipv4.tcp_max_syn_backlog = %s\n' "${syn_backlog}"
+        printf '%s\n' 'net.ipv4.tcp_syncookies = 1'
+        printf 'fs.file-max = %s\n' "${file_max}"
+        if [[ "${enable_bbr}" -eq 1 ]] \
+            && sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+            printf '%s\n' 'net.core.default_qdisc = fq'
+            printf '%s\n' 'net.ipv4.tcp_congestion_control = bbr'
+        elif [[ "${enable_bbr}" -eq 1 ]]; then
+            warn "当前内核未提供 BBR，跳过 BBR 设置。"
+        fi
+    } > "${temp}"
+    install -m 644 "${temp}" "${sysctl_file}"
+    rm -f "${temp}"
+    if ! sysctl -p "${sysctl_file}"; then
+        warn "内核参数应用失败，正在恢复。"
+        restore_tuning "${backup_dir}"
+        die "调优失败，已恢复原设置。"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        mkdir -p "$(dirname "${limits_file}")"
+        cat > "${limits_file}" <<EOF
+[Service]
+LimitNOFILE=${nofile_limit}
+EOF
+        chmod 644 "${limits_file}"
+        systemctl daemon-reload
+        if command -v nginx >/dev/null 2>&1 && systemctl cat nginx >/dev/null 2>&1; then
+            nginx -t
+            if ! systemctl restart nginx; then
+                warn "Nginx 重启失败，正在恢复调优前设置。"
+                restore_tuning "${backup_dir}"
+                die "调优失败，已恢复原设置。"
+            fi
+        fi
+    fi
+    log "保守调优已应用，原设置备份在: ${backup_dir}"
+    warn "脚本未修改 Swap、THP、防火墙或全局用户限制。"
+}
+
+update_nginx_package() {
+    [[ $# -eq 0 ]] || die "用法: ${PROGRAM} update"
+    require_root
+    command -v nginx >/dev/null 2>&1 || die "Nginx 尚未安装。"
+    local timestamp backup
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup="/var/backups/nginx-easy-deploy/update-${timestamp}.tar.gz"
+    mkdir -p "$(dirname "${backup}")"
+    export_bundle --output "${backup}" --force
+
+    log "正在使用系统软件源更新 Nginx。"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade nginx
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf upgrade -y nginx
+    elif command -v yum >/dev/null 2>&1; then
+        yum update -y nginx
+    elif command -v apk >/dev/null 2>&1; then
+        apk upgrade nginx
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive update nginx
+    else
+        die "未找到支持的软件包管理器。"
+    fi
+    start_nginx
+    log "Nginx 更新完成。更新前备份: ${backup}"
+    warn "配置可从备份恢复；软件包降级需要使用发行版的软件包管理器。"
 }
 
 remove_path_for_restore() {
@@ -1200,19 +1796,19 @@ interactive_export() {
 }
 
 interactive_delete() {
-    local domain cert answer
+    local domain cert files answer
+    local -a args=()
     read -r -p "要删除的域名: " domain
     read -r -p "同时删除 Certbot 证书？[y/N]: " cert
+    read -r -p "备份静态站点文件？[y/N]: " files
     read -r -p "确认删除 ${domain}？输入 yes 继续: " answer
     if [[ "${answer}" != "yes" ]]; then
         log "已取消。"
         return 0
     fi
-    if [[ "${cert}" =~ ^[Yy]$ ]]; then
-        run_menu_action delete_site "${domain}" --delete-cert
-    else
-        run_menu_action delete_site "${domain}"
-    fi
+    [[ "${cert}" =~ ^[Yy]$ ]] && args+=(--delete-cert)
+    [[ "${files}" =~ ^[Yy]$ ]] && args+=(--backup-files)
+    run_menu_action delete_site "${domain}" "${args[@]}"
 }
 
 interactive_custom_certificate() {
@@ -1227,6 +1823,55 @@ interactive_custom_certificate() {
     else
         run_menu_action install_custom_certificate "${domain}" "${cert_file}" "${key_file}"
     fi
+}
+
+interactive_cloudflare_dns() {
+    local domain email token wildcard staging credentials
+    local -a args=()
+    read -r -p "域名: " domain
+    read -r -p "证书通知邮箱: " email
+    read -r -s -p "Cloudflare API Token（输入不显示）: " token
+    printf '\n'
+    read -r -p "同时申请 *.${domain} 通配符证书？[y/N]: " wildcard
+    read -r -p "使用 Let's Encrypt 测试环境？[y/N]: " staging
+    credentials="$(mktemp /tmp/ngx-easy-cloudflare-token.XXXXXX)"
+    printf 'dns_cloudflare_api_token = %s\n' "${token}" > "${credentials}"
+    chmod 600 "${credentials}"
+    [[ "${wildcard}" =~ ^[Yy]$ ]] && args+=(--wildcard)
+    [[ "${staging}" =~ ^[Yy]$ ]] && args+=(--staging)
+    run_menu_action enable_cloudflare_dns_https \
+        "${domain}" "${email}" "${credentials}" "${args[@]}"
+    rm -f "${credentials}"
+    token=""
+}
+
+interactive_cloudflare_realip() {
+    local schedule
+    read -r -p "安装每周自动更新任务？[y/N]: " schedule
+    if [[ "${schedule}" =~ ^[Yy]$ ]]; then
+        run_menu_action cloudflare_realip --schedule
+    else
+        run_menu_action cloudflare_realip
+    fi
+}
+
+interactive_tune() {
+    local answer bbr
+    local -a args=()
+    log "将设置保守连接队列、文件限制；不会修改 Swap、THP 或防火墙。"
+    read -r -p "内核支持时同时启用 BBR？[y/N]: " bbr
+    read -r -p "输入 apply 继续: " answer
+    [[ "${answer}" == "apply" ]] || { log "已取消。"; return 0; }
+    [[ "${bbr}" =~ ^[Yy]$ ]] && args+=(--bbr)
+    run_menu_action tune_nginx "${args[@]}"
+}
+
+interactive_update() {
+    local answer
+    log "更新前会自动备份 Nginx 配置和证书。"
+    read -r -p "输入 update 继续: " answer
+    [[ "${answer}" == "update" ]] || { log "已取消。"; return 0; }
+    run_menu_action update_nginx_package
 }
 
 interactive_menu() {
@@ -1248,17 +1893,23 @@ interactive_menu() {
   2. 新建反向代理站点
   3. 新建静态网站
   4. 给已有站点启用 HTTPS
-  5. 上传并安装自有证书
-  6. 查看站点
-  7. 删除站点
-  8. 续签全部证书
-  9. 导出配置和证书
- 10. 从迁移包恢复
- 11. 查看运行状态
+  5. 使用 Cloudflare DNS 申请证书/通配符证书
+  6. 上传并安装自有证书
+  7. 查看站点
+  8. 环境与域名诊断
+  9. 检查本机证书到期时间
+ 10. 更新 Cloudflare 真实访客 IP 配置
+ 11. 删除站点（删除前自动备份）
+ 12. 续签全部证书
+ 13. 导出配置和证书
+ 14. 从迁移包恢复
+ 15. 查看运行状态
+ 16. 可选的保守系统调优
+ 17. 备份后更新 Nginx
   0. 退出
 ------------------------------------------------------------
 EOF
-        read -r -p "请选择 [0-11]: " choice || return 0
+        read -r -p "请选择 [0-17]: " choice || return 0
         printf '\n'
         case "${choice}" in
             1) run_menu_action install_stack ;;
@@ -1269,16 +1920,25 @@ EOF
                 read -r -p "证书通知邮箱: " email
                 run_menu_action enable_https_domain "${domain}" "${email}"
                 ;;
-            5) interactive_custom_certificate ;;
-            6) run_menu_action list_sites ;;
-            7) interactive_delete ;;
-            8) run_menu_action renew_certificates ;;
-            9) interactive_export ;;
-            10)
+            5) interactive_cloudflare_dns ;;
+            6) interactive_custom_certificate ;;
+            7) run_menu_action list_sites ;;
+            8)
+                read -r -p "要检查 DNS 的域名（可留空）: " domain
+                run_menu_action doctor "${domain}"
+                ;;
+            9) run_menu_action check_certificates ;;
+            10) interactive_cloudflare_realip ;;
+            11) interactive_delete ;;
+            12) run_menu_action renew_certificates ;;
+            13) interactive_export ;;
+            14)
                 read -r -p "迁移包路径: " archive
                 run_menu_action restore_bundle "${archive}"
                 ;;
-            11) run_menu_action show_status ;;
+            15) run_menu_action show_status ;;
+            16) interactive_tune ;;
+            17) interactive_update ;;
             0) return 0 ;;
             *) warn "无效选项。" ;;
         esac
@@ -1305,6 +1965,24 @@ main() {
             ;;
         cert|certificate)
             install_custom_certificate "$@"
+            ;;
+        dns-ssl|cloudflare-ssl)
+            enable_cloudflare_dns_https "$@"
+            ;;
+        doctor|diagnose)
+            doctor "$@"
+            ;;
+        certs|cert-check)
+            check_certificates "$@"
+            ;;
+        cf-realip|cloudflare-realip)
+            cloudflare_realip "$@"
+            ;;
+        tune)
+            tune_nginx "$@"
+            ;;
+        update)
+            update_nginx_package "$@"
             ;;
         sites|list)
             list_sites

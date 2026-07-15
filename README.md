@@ -13,9 +13,15 @@
 - 自动申请和续签 Let's Encrypt 证书
 - 上传并安装自有证书，可选单独证书链
 - 检查证书格式、有效期、域名和公私钥匹配
+- 查看 Nginx 当前证书的到期时间和风险状态
+- 使用 Cloudflare DNS 自动申请、续签通配符证书
+- 自动更新 Cloudflare IP 段，让访问日志记录真实访客 IP
+- 检查系统环境、Nginx、端口、域名解析和公网 IP
+- 删除站点前自动持久备份配置和证书，可选备份静态文件
 - 导出 Nginx 配置、证书、外部 include 和 ACME 数据
 - 新服务器一键恢复，恢复前自动创建回滚包
 - 配置写入后先运行 `nginx -t`，失败时恢复原文件
+- 可选的保守系统调优，以及备份后更新 Nginx
 
 ## 支持范围
 
@@ -110,6 +116,44 @@ sudo bash nginx-easy-deploy.sh cert example.com \
 
 脚本会把文件安装到 `/etc/nginx/ssl/<域名>/`。自有证书不会由 Certbot 自动续签，到期前需要重新执行 `cert` 命令。
 
+## Cloudflare DNS 证书
+
+适合域名开启了 Cloudflare 代理、80 端口不方便开放，或需要通配符证书的场景。先创建只允许目标域名 `Zone:DNS:Edit` 的 Cloudflare API Token，再准备凭据文件：
+
+```ini
+dns_cloudflare_api_token = YOUR_API_TOKEN
+```
+
+为已有站点申请 `example.com` 和 `*.example.com` 证书：
+
+```bash
+chmod 600 cloudflare.ini
+sudo bash nginx-easy-deploy.sh dns-ssl example.com you@example.com \
+  cloudflare.ini --wildcard
+```
+
+脚本会把凭据安全保存到 `/etc/letsencrypt/cloudflare/`，供 Certbot 自动续签使用。Token 不会出现在命令参数或日志里。
+
+## Cloudflare 真实访客 IP
+
+开启 Cloudflare 代理后，执行：
+
+```bash
+sudo bash nginx-easy-deploy.sh cf-realip
+```
+
+脚本从 Cloudflare 官方地址下载 IPv4/IPv6 段，校验后生成 Nginx `real_ip` 配置。需要每周自动更新时：
+
+```bash
+sudo bash nginx-easy-deploy.sh cf-realip --schedule
+```
+
+它使用系统的每周任务，不运行常驻进程。删除脚本管理的配置和任务：
+
+```bash
+sudo bash nginx-easy-deploy.sh cf-realip --remove
+```
+
 ## 导出与迁移
 
 旧服务器执行：
@@ -157,9 +201,30 @@ sudo bash nginx-easy-deploy.sh export --encrypt --include /srv/my-site
 ```bash
 sudo bash nginx-easy-deploy.sh sites
 sudo bash nginx-easy-deploy.sh status
+sudo bash nginx-easy-deploy.sh doctor example.com
+sudo bash nginx-easy-deploy.sh certs
 sudo bash nginx-easy-deploy.sh renew
 sudo bash nginx-easy-deploy.sh delete example.com
 sudo bash nginx-easy-deploy.sh delete example.com --delete-cert
+sudo bash nginx-easy-deploy.sh delete example.com --backup-files
+```
+
+删除站点前的持久备份保存在 `/var/backups/nginx-easy-deploy/sites/`。
+
+可选的保守调优只提高偏低的连接队列和文件上限，并设置 Nginx systemd 文件限制；不会降低已有参数，也不会修改 Swap、THP 或防火墙：
+
+```bash
+sudo bash nginx-easy-deploy.sh tune
+sudo bash nginx-easy-deploy.sh tune --bbr
+sudo bash nginx-easy-deploy.sh tune --restore latest
+```
+
+BBR 不会默认启用，只有明确添加 `--bbr` 且当前内核支持时才会设置。
+
+使用系统软件源更新 Nginx 前自动创建完整备份：
+
+```bash
+sudo bash nginx-easy-deploy.sh update
 ```
 
 ## 迁移注意事项

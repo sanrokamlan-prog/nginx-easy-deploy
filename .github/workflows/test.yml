@@ -16,3 +16,7 @@ jobs:
         run: bash -n nginx-easy-deploy.sh tests/test_helpers.sh
       - name: Run helper tests
         run: bash tests/test_helpers.sh
+      - name: Smoke-test command interface
+        run: |
+          bash nginx-easy-deploy.sh --help >/dev/null
+          test "$(bash nginx-easy-deploy.sh --version)" = "0.2.0"
