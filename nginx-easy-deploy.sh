@@ -4,8 +4,9 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 PROGRAM="${0##*/}"
+UI_LANG="${NGX_EASY_LANG:-}"
 WORK_DIR=""
 CHANGES_STARTED=0
 ROLLBACK_ROOT=""
@@ -17,9 +18,53 @@ log()  { printf '[ngx-migrate] %s\n' "$*"; }
 warn() { printf '[ngx-migrate] WARNING: %s\n' "$*" >&2; }
 die()  { printf '[ngx-migrate] ERROR: %s\n' "$*" >&2; exit 1; }
 
-usage() {
+ui_text() {
+    if [[ "${UI_LANG:-zh}" == "en" ]]; then
+        printf '%s' "$2"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+log_ui()  { log "$(ui_text "$1" "$2")"; }
+warn_ui() { warn "$(ui_text "$1" "$2")"; }
+die_ui()  { die "$(ui_text "$1" "$2")"; }
+
+normalize_ui_language() {
+    local language
+    language="$(printf '%s' "${UI_LANG:-}" | tr 'A-Z' 'a-z')"
+    case "${language}" in
+        en|en_*|english) UI_LANG="en" ;;
+        zh|zh_*|cn|chinese|"") UI_LANG="zh" ;;
+        *) die "Unsupported language: ${UI_LANG}. Use zh or en." ;;
+    esac
+}
+
+select_ui_language() {
+    local force="${1:-0}" choice
+    if [[ "${force}" -eq 0 && -n "${UI_LANG}" ]]; then
+        normalize_ui_language
+        return 0
+    fi
+    cat <<'EOF'
+请选择语言 / Select language
+  1. 中文
+  2. English
+EOF
+    read -r -p "> " choice || choice="1"
+    case "${choice}" in
+        2|en|EN|English|english) UI_LANG="en" ;;
+        *) UI_LANG="zh" ;;
+    esac
+}
+
+usage_zh() {
     cat <<EOF
 nginx-easy-deploy v${VERSION} - 原生 Nginx 一键部署与迁移
+
+语言切换：
+  sudo bash ${PROGRAM} --lang en
+  sudo NGX_EASY_LANG=en bash ${PROGRAM}
 
 直接打开中文菜单：
   sudo bash ${PROGRAM}
@@ -82,6 +127,81 @@ Cloudflare DNS 证书：
 仅管理原生 Nginx，不支持 Docker、Nginx Proxy Manager、Kubernetes；
 OpenResty 配置可以导出，但新机需要先自行安装兼容版本。
 EOF
+}
+
+usage_en() {
+    cat <<EOF
+nginx-easy-deploy v${VERSION} - native Nginx deployment and migration
+
+Open the interactive menu:
+  sudo bash ${PROGRAM} --lang en
+  sudo NGX_EASY_LANG=en bash ${PROGRAM}
+
+Common commands:
+  sudo bash ${PROGRAM} install
+  sudo bash ${PROGRAM} proxy example.com 127.0.0.1:3000 --email you@example.com
+  sudo bash ${PROGRAM} static example.com /var/www/example.com --email you@example.com
+  sudo bash ${PROGRAM} cert example.com fullchain.pem privkey.pem
+  sudo bash ${PROGRAM} dns-ssl example.com you@example.com cloudflare.ini --wildcard
+  sudo bash ${PROGRAM} doctor [example.com]
+  sudo bash ${PROGRAM} certs
+  sudo bash ${PROGRAM} cf-realip [--schedule]
+  sudo bash ${PROGRAM} tune [--bbr]
+  sudo bash ${PROGRAM} update
+  sudo bash ${PROGRAM} sites
+  sudo bash ${PROGRAM} status
+  sudo bash ${PROGRAM} renew
+  sudo bash ${PROGRAM} delete example.com [--delete-cert] [--backup-files]
+
+Export on the old server:
+  sudo bash ${PROGRAM} export
+  sudo bash ${PROGRAM} export -o /root/nginx-backup.tar.gz
+  sudo bash ${PROGRAM} export --encrypt
+  sudo bash ${PROGRAM} export --with-webroot
+  sudo bash ${PROGRAM} export --include /path/to/extra/files
+
+Restore on the new server:
+  sudo bash ${PROGRAM} restore nginx-backup.tar.gz
+  sudo bash ${PROGRAM} restore nginx-backup.tar.gz.enc
+
+Site options:
+  --email ADDRESS       Email used for Let's Encrypt registration
+  --no-ssl              Deploy HTTP only
+  --force               Replace an existing script-managed site
+
+Cloudflare DNS certificate:
+  dns-ssl DOMAIN EMAIL CREDENTIALS_FILE [--wildcard] [--staging]
+  CREDENTIALS_FILE: dns_cloudflare_api_token = YOUR_TOKEN
+  Use a token restricted to Zone:DNS:Edit for the target zone
+
+Operations:
+  cf-realip             Refresh the trusted Cloudflare IP ranges
+  cf-realip --schedule  Refresh now and install a weekly update task
+  cf-realip --remove    Remove the managed real-IP config and task
+  tune [--bbr]          Apply conservative tuning; BBR is opt-in
+  tune --restore latest Restore the latest pre-tuning state
+  update                 Back up and update Nginx from system packages
+
+Migration options:
+  -o, --output FILE     Set the archive path
+  --encrypt             Encrypt the archive with an OpenSSL passphrase
+  --with-webroot        Include static roots and aliases referenced by Nginx
+  --include PATH        Include another file or directory; repeatable
+  --force               Export invalid config or restore across distributions
+  -h, --help            Show this help
+
+Supported: Debian, Ubuntu, CentOS, RHEL, Rocky Linux and AlmaLinux.
+Native Nginx only; Docker, Nginx Proxy Manager and Kubernetes are out of scope.
+OpenResty configs can be exported, but a compatible build must exist before restore.
+EOF
+}
+
+usage() {
+    if [[ "${UI_LANG:-zh}" == "en" ]]; then
+        usage_en
+    else
+        usage_zh
+    fi
 }
 
 cleanup() {
@@ -370,7 +490,8 @@ install_nginx() {
         die "This backup uses OpenResty. Install a compatible OpenResty build first, then rerun restore."
     fi
 
-    log "Nginx 未安装，正在使用系统软件源安装。"
+    log_ui "Nginx 未安装，正在使用系统软件源安装。" \
+        "Nginx is not installed; installing it from the system package repository."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
@@ -393,7 +514,8 @@ install_certbot() {
         return 0
     fi
 
-    log "正在安装 Certbot 和 Nginx 插件。"
+    log_ui "正在安装 Certbot 和 Nginx 插件。" \
+        "Installing Certbot and its Nginx plugin."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
@@ -425,7 +547,8 @@ install_cloudflare_certbot() {
         return 0
     fi
 
-    log "正在安装 Certbot Cloudflare DNS 插件。"
+    log_ui "正在安装 Certbot Cloudflare DNS 插件。" \
+        "Installing the Certbot Cloudflare DNS plugin."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y python3-certbot-dns-cloudflare
@@ -448,14 +571,16 @@ open_firewall_ports() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw allow 'Nginx Full' >/dev/null 2>&1 \
             || { ufw allow 80/tcp && ufw allow 443/tcp; }
-        log "已在 UFW 放行 80/443 端口。"
+        log_ui "已在 UFW 放行 80/443 端口。" \
+            "Opened ports 80 and 443 in UFW."
     fi
     if command -v firewall-cmd >/dev/null 2>&1 \
         && firewall-cmd --state >/dev/null 2>&1; then
         firewall-cmd --permanent --add-service=http >/dev/null
         firewall-cmd --permanent --add-service=https >/dev/null
         firewall-cmd --reload >/dev/null
-        log "已在 firewalld 放行 80/443 端口。"
+        log_ui "已在 firewalld 放行 80/443 端口。" \
+            "Opened HTTP and HTTPS services in firewalld."
     fi
 }
 
@@ -490,7 +615,8 @@ ensure_managed_config_dir() {
     config_dump="$(nginx -T 2>&1 || true)"
     if ! printf '%s\n' "${config_dump}" \
         | grep -Eq '^[[:space:]]*include[[:space:]]+[^;]*conf\.d/\*\.conf;'; then
-        die "当前 nginx.conf 未加载 conf.d/*.conf，脚本不会冒险自动改写非标准主配置。"
+        die_ui "当前 nginx.conf 未加载 conf.d/*.conf，脚本不会冒险自动改写非标准主配置。" \
+            "The current nginx.conf does not include conf.d/*.conf. Refusing to rewrite a non-standard main config."
     fi
     mkdir -p "${MANAGED_CONFIG_DIR}"
 }
@@ -499,12 +625,13 @@ install_stack() {
     require_root
     install_nginx nginx
     if ! install_certbot; then
-        warn "Certbot 安装失败，Nginx 已可使用，但自动 HTTPS 暂不可用。"
+        warn_ui "Certbot 安装失败，Nginx 已可使用，但自动 HTTPS 暂不可用。" \
+            "Certbot installation failed. Nginx is usable, but automatic HTTPS is unavailable."
     fi
     ensure_managed_config_dir
     open_firewall_ports
     start_nginx
-    log "原生 Nginx 安装完成。"
+    log_ui "原生 Nginx 安装完成。" "Native Nginx installation completed."
     nginx -v 2>&1
 }
 
@@ -599,31 +726,36 @@ EOF
 enable_https_domain() {
     local domain="${1:-}" email="${2:-}"
     require_root
-    validate_domain "${domain}" || die "域名格式不正确: ${domain}"
-    validate_email "${email}" || die "邮箱格式不正确: ${email}"
+    validate_domain "${domain}" || die_ui "域名格式不正确: ${domain}" "Invalid domain: ${domain}"
+    validate_email "${email}" || die_ui "邮箱格式不正确: ${email}" "Invalid email address: ${email}"
     command -v nginx >/dev/null 2>&1 || install_nginx nginx
     ensure_managed_config_dir
     open_firewall_ports
     [[ -f "$(site_config_path "${domain}")" ]] \
-        || die "没有找到脚本管理的站点: ${domain}"
-    install_certbot || die "Certbot 或其 Nginx 插件安装失败。"
+        || die_ui "没有找到脚本管理的站点: ${domain}" "No script-managed site was found for: ${domain}"
+    install_certbot || die_ui "Certbot 或其 Nginx 插件安装失败。" \
+        "Certbot or its Nginx plugin could not be installed."
 
-    log "正在为 ${domain} 申请并配置 Let's Encrypt 证书。"
+    log_ui "正在为 ${domain} 申请并配置 Let's Encrypt 证书。" \
+        "Requesting and configuring a Let's Encrypt certificate for ${domain}."
     certbot --nginx --non-interactive --agree-tos --redirect \
         --email "${email}" --domains "${domain}"
     reload_nginx
-    log "HTTPS 已启用: https://${domain}"
+    log_ui "HTTPS 已启用: https://${domain}" "HTTPS enabled: https://${domain}"
 }
 
 install_custom_certificate() {
-    [[ $# -ge 3 ]] || die "用法: ${PROGRAM} cert DOMAIN CERT_FILE KEY_FILE [--chain CHAIN_FILE] [--force]"
+    [[ $# -ge 3 ]] || die_ui \
+        "用法: ${PROGRAM} cert DOMAIN CERT_FILE KEY_FILE [--chain CHAIN_FILE] [--force]" \
+        "Usage: ${PROGRAM} cert DOMAIN CERT_FILE KEY_FILE [--chain CHAIN_FILE] [--force]"
     local domain="$1" cert_file="$2" key_file="$3"
     shift 3
     local chain_file="" force=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --chain)
-                [[ $# -ge 2 ]] || die "--chain 需要证书链文件。"
+                [[ $# -ge 2 ]] || die_ui "--chain 需要证书链文件。" \
+                    "--chain requires a certificate chain file."
                 chain_file="$2"
                 shift 2
                 ;;
@@ -632,7 +764,7 @@ install_custom_certificate() {
                 shift
                 ;;
             *)
-                die "未知证书选项: $1"
+                die_ui "未知证书选项: $1" "Unknown certificate option: $1"
                 ;;
         esac
     done
@@ -641,17 +773,21 @@ install_custom_certificate() {
     require_command openssl
     require_command sha256sum
     domain="$(printf '%s' "${domain}" | tr 'A-Z' 'a-z')"
-    validate_domain "${domain}" || die "域名格式不正确: ${domain}"
-    [[ -f "${cert_file}" && -r "${cert_file}" ]] || die "证书文件不可读: ${cert_file}"
-    [[ -f "${key_file}" && -r "${key_file}" ]] || die "私钥文件不可读: ${key_file}"
+    validate_domain "${domain}" || die_ui "域名格式不正确: ${domain}" "Invalid domain: ${domain}"
+    [[ -f "${cert_file}" && -r "${cert_file}" ]] \
+        || die_ui "证书文件不可读: ${cert_file}" "Certificate file is not readable: ${cert_file}"
+    [[ -f "${key_file}" && -r "${key_file}" ]] \
+        || die_ui "私钥文件不可读: ${key_file}" "Private key file is not readable: ${key_file}"
     if [[ -n "${chain_file}" ]]; then
-        [[ -f "${chain_file}" && -r "${chain_file}" ]] || die "证书链文件不可读: ${chain_file}"
+        [[ -f "${chain_file}" && -r "${chain_file}" ]] \
+            || die_ui "证书链文件不可读: ${chain_file}" "Certificate chain file is not readable: ${chain_file}"
     fi
 
     openssl x509 -in "${cert_file}" -noout >/dev/null \
-        || die "无法解析证书文件。"
+        || die_ui "无法解析证书文件。" "The certificate file could not be parsed."
     openssl pkey -in "${key_file}" -passin pass: -noout >/dev/null 2>&1 \
-        || die "无法解析私钥，或私钥带有密码。Nginx 自动启动需要无密码私钥。"
+        || die_ui "无法解析私钥，或私钥带有密码。Nginx 自动启动需要无密码私钥。" \
+            "The private key is invalid or encrypted. Nginx requires an unencrypted private key for unattended startup."
 
     local cert_hash key_hash
     cert_hash="$(openssl x509 -in "${cert_file}" -pubkey -noout \
@@ -659,19 +795,25 @@ install_custom_certificate() {
     key_hash="$(openssl pkey -in "${key_file}" -passin pass: -pubout -outform DER 2>/dev/null \
         | sha256sum | awk '{print $1}')"
     [[ -n "${cert_hash}" && "${cert_hash}" == "${key_hash}" ]] \
-        || die "证书与私钥不匹配。"
+        || die_ui "证书与私钥不匹配。" "The certificate and private key do not match."
 
     if ! openssl x509 -in "${cert_file}" -checkend 0 -noout >/dev/null; then
-        [[ "${force}" -eq 1 ]] || die "证书已经过期；确认继续时添加 --force。"
-        warn "正在安装已过期证书，因为使用了 --force。"
+        [[ "${force}" -eq 1 ]] || die_ui "证书已经过期；确认继续时添加 --force。" \
+            "The certificate has expired. Add --force only if you intend to continue."
+        warn_ui "正在安装已过期证书，因为使用了 --force。" \
+            "Installing an expired certificate because --force was supplied."
     fi
     if openssl x509 -help 2>&1 | grep -q -- '-checkhost'; then
         if ! openssl x509 -in "${cert_file}" -checkhost "${domain}" -noout >/dev/null 2>&1; then
-            [[ "${force}" -eq 1 ]] || die "证书不匹配域名 ${domain}；确认继续时添加 --force。"
-            warn "证书域名不匹配，因为使用了 --force 仍将继续。"
+            [[ "${force}" -eq 1 ]] || die_ui \
+                "证书不匹配域名 ${domain}；确认继续时添加 --force。" \
+                "The certificate does not match ${domain}. Add --force only if you intend to continue."
+            warn_ui "证书域名不匹配，因为使用了 --force 仍将继续。" \
+                "The certificate hostname does not match, but --force was supplied."
         fi
     else
-        warn "当前 OpenSSL 版本过旧，无法自动检查证书域名。"
+        warn_ui "当前 OpenSSL 版本过旧，无法自动检查证书域名。" \
+            "This OpenSSL version is too old to verify the certificate hostname automatically."
     fi
 
     command -v nginx >/dev/null 2>&1 || install_nginx nginx
@@ -679,9 +821,11 @@ install_custom_certificate() {
     open_firewall_ports
     local config
     config="$(site_config_path "${domain}")"
-    [[ -f "${config}" ]] || die "没有找到脚本管理的站点: ${domain}"
+    [[ -f "${config}" ]] || die_ui "没有找到脚本管理的站点: ${domain}" \
+        "No script-managed site was found for: ${domain}"
     if grep -Fq '# managed by Certbot' "${config}"; then
-        die "该站点正由 Certbot 管理。请先删除其 Certbot HTTPS 配置，或新建 --no-ssl 站点后上传自有证书。"
+        die_ui "该站点正由 Certbot 管理。请先删除其 Certbot HTTPS 配置，或新建 --no-ssl 站点后上传自有证书。" \
+            "This site is managed by Certbot. Remove its Certbot HTTPS changes or create an HTTP-only site before installing a custom certificate."
     fi
 
     local cert_dir="/etc/nginx/ssl/${domain}"
@@ -730,7 +874,7 @@ install_custom_certificate() {
         rm -rf "${cert_dir}"
         [[ -d "${cert_backup}" ]] && cp -a "${cert_backup}" "${cert_dir}"
         rm -rf "${work}"
-        die "无法识别站点配置结构。"
+        die_ui "无法识别站点配置结构。" "The site configuration structure was not recognized."
     }
     install -m 644 "${new_config}" "${config}"
 
@@ -739,18 +883,21 @@ install_custom_certificate() {
         rm -rf "${cert_dir}"
         [[ -d "${cert_backup}" ]] && cp -a "${cert_backup}" "${cert_dir}"
         rm -rf "${work}"
-        die "自有证书配置校验失败，已恢复原配置和证书。"
+        die_ui "自有证书配置校验失败，已恢复原配置和证书。" \
+            "Custom certificate validation failed; the previous configuration and certificate were restored."
     fi
     reload_nginx
     rm -rf "${work}"
-    log "自有证书已安装: https://${domain}"
-    warn "自有证书不会由 Certbot 自动续签，到期前请重新运行 cert 命令更新。"
+    log_ui "自有证书已安装: https://${domain}" "Custom certificate installed: https://${domain}"
+    warn_ui "自有证书不会由 Certbot 自动续签，到期前请重新运行 cert 命令更新。" \
+        "Custom certificates are not renewed by Certbot. Run the cert command again before expiry."
 }
 
 create_site() {
     local kind="$1"
     shift
-    [[ $# -ge 2 ]] || die "缺少参数。请查看 ${PROGRAM} --help。"
+    [[ $# -ge 2 ]] || die_ui "缺少参数。请查看 ${PROGRAM} --help。" \
+        "Missing arguments. Run ${PROGRAM} --help."
     local domain="$1" target="$2"
     shift 2
     local email="" no_ssl=0 force=0
@@ -758,7 +905,8 @@ create_site() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --email)
-                [[ $# -ge 2 ]] || die "--email 需要邮箱地址。"
+                [[ $# -ge 2 ]] || die_ui "--email 需要邮箱地址。" \
+                    "--email requires an email address."
                 email="$2"
                 shift 2
                 ;;
@@ -771,16 +919,16 @@ create_site() {
                 shift
                 ;;
             *)
-                die "未知站点选项: $1"
+                die_ui "未知站点选项: $1" "Unknown site option: $1"
                 ;;
         esac
     done
 
     require_root
     domain="$(printf '%s' "${domain}" | tr 'A-Z' 'a-z')"
-    validate_domain "${domain}" || die "域名格式不正确: ${domain}"
+    validate_domain "${domain}" || die_ui "域名格式不正确: ${domain}" "Invalid domain: ${domain}"
     if [[ -n "${email}" ]]; then
-        validate_email "${email}" || die "邮箱格式不正确: ${email}"
+        validate_email "${email}" || die_ui "邮箱格式不正确: ${email}" "Invalid email address: ${email}"
     fi
 
     command -v nginx >/dev/null 2>&1 || install_nginx nginx
@@ -788,10 +936,13 @@ create_site() {
     open_firewall_ports
 
     if [[ "${kind}" == "proxy" ]]; then
-        target="$(normalize_upstream "${target}")" || die "反代地址不正确: ${target}"
+        target="$(normalize_upstream "${target}")" \
+            || die_ui "反代地址不正确: ${target}" "Invalid reverse proxy upstream: ${target}"
         ensure_websocket_map
     else
-        validate_static_root "${target}" || die "静态目录必须是安全的绝对路径: ${target}"
+        validate_static_root "${target}" \
+            || die_ui "静态目录必须是安全的绝对路径: ${target}" \
+                "The static root must be a safe absolute path: ${target}"
         mkdir -p "${target}"
         chmod 755 "${target}"
     fi
@@ -799,7 +950,8 @@ create_site() {
     local config backup="" temp
     config="$(site_config_path "${domain}")"
     if [[ -e "${config}" && "${force}" -ne 1 ]]; then
-        die "站点已存在: ${domain}。确认覆盖时添加 --force。"
+        die_ui "站点已存在: ${domain}。确认覆盖时添加 --force。" \
+            "The site already exists: ${domain}. Add --force to replace it."
     fi
     if [[ -e "${config}" ]]; then
         backup="$(mktemp /tmp/ngx-easy-site-backup.XXXXXX)"
@@ -861,24 +1013,27 @@ EOF
     if ! nginx -t; then
         rm -f "${config}"
         [[ -n "${backup}" ]] && mv -f "${backup}" "${config}"
-        die "新配置校验失败，已恢复原配置。"
+        die_ui "新配置校验失败，已恢复原配置。" \
+            "The new configuration failed validation; the previous file was restored."
     fi
     [[ -n "${backup}" ]] && rm -f "${backup}"
     reload_nginx
-    log "HTTP 站点已部署: http://${domain}"
+    log_ui "HTTP 站点已部署: http://${domain}" "HTTP site deployed: http://${domain}"
 
     if [[ "${no_ssl}" -eq 0 && -n "${email}" ]]; then
         if ! enable_https_domain "${domain}" "${email}"; then
-            warn "HTTPS 申请失败，但 HTTP 站点仍然可用。请检查域名解析和 80/443 端口。"
+            warn_ui "HTTPS 申请失败，但 HTTP 站点仍然可用。请检查域名解析和 80/443 端口。" \
+                "HTTPS issuance failed, but the HTTP site remains available. Check DNS and ports 80/443."
         fi
     elif [[ "${no_ssl}" -eq 0 ]]; then
-        warn "未提供邮箱，本次只部署 HTTP。之后可运行: ${PROGRAM} ssl ${domain} you@example.com"
+        warn_ui "未提供邮箱，本次只部署 HTTP。之后可运行: ${PROGRAM} ssl ${domain} you@example.com" \
+            "No email was provided, so only HTTP was deployed. Enable HTTPS later with: ${PROGRAM} ssl ${domain} you@example.com"
     fi
 }
 
 list_sites() {
     require_root
-    command -v nginx >/dev/null 2>&1 || die "Nginx 尚未安装。"
+    command -v nginx >/dev/null 2>&1 || die_ui "Nginx 尚未安装。" "Nginx is not installed."
     ensure_managed_config_dir
     local found=0 file domain kind target
     shopt -s nullglob
@@ -897,7 +1052,7 @@ list_sites() {
         found=1
     done
     shopt -u nullglob
-    [[ "${found}" -eq 1 ]] || log "暂无脚本管理的站点。"
+    [[ "${found}" -eq 1 ]] || log_ui "暂无脚本管理的站点。" "No script-managed sites were found."
 }
 
 delete_site() {
@@ -907,24 +1062,26 @@ delete_site() {
         case "$1" in
             --delete-cert) delete_cert=1; shift ;;
             --backup-files) backup_files=1; shift ;;
-            *) die "未知删除选项: $1" ;;
+            *) die_ui "未知删除选项: $1" "Unknown delete option: $1" ;;
         esac
     done
     require_root
-    validate_domain "${domain}" || die "域名格式不正确: ${domain}"
+    validate_domain "${domain}" || die_ui "域名格式不正确: ${domain}" "Invalid domain: ${domain}"
     ensure_managed_config_dir
     local config backup
     config="$(site_config_path "${domain}")"
-    [[ -f "${config}" ]] || die "站点不存在: ${domain}"
+    [[ -f "${config}" ]] || die_ui "站点不存在: ${domain}" "Site not found: ${domain}"
     grep -Fq '# Managed by nginx-easy-deploy.' "${config}" \
-        || die "该文件不是脚本创建的，拒绝自动删除: ${config}"
+        || die_ui "该文件不是脚本创建的，拒绝自动删除: ${config}" \
+            "Refusing to delete a file that was not created by this script: ${config}"
     backup_site "${domain}" "${config}" "${backup_files}"
     backup="$(mktemp /tmp/ngx-easy-delete-backup.XXXXXX)"
     cp -a "${config}" "${backup}"
     rm -f "${config}"
     if ! nginx -t; then
         mv -f "${backup}" "${config}"
-        die "删除后 Nginx 校验失败，已恢复站点。"
+        die_ui "删除后 Nginx 校验失败，已恢复站点。" \
+            "Nginx validation failed after deletion; the site was restored."
     fi
     rm -f "${backup}"
     reload_nginx
@@ -934,7 +1091,7 @@ delete_site() {
     if [[ "${delete_cert}" -eq 1 && -d "/etc/nginx/ssl/${domain}" ]]; then
         rm -rf -- "/etc/nginx/ssl/${domain}"
     fi
-    log "站点已删除: ${domain}"
+    log_ui "站点已删除: ${domain}" "Site deleted: ${domain}"
 }
 
 backup_site() {
@@ -965,12 +1122,13 @@ backup_site() {
         "${domain}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${include_files}" \
         > "${backup_dir}/metadata.tsv"
     chmod -R go-rwx "${backup_dir}"
-    log "站点备份已保存: ${backup_dir}"
+    log_ui "站点备份已保存: ${backup_dir}" "Site backup saved: ${backup_dir}"
 }
 
 renew_certificates() {
     require_root
-    install_certbot || die "Certbot 或其 Nginx 插件安装失败。"
+    install_certbot || die_ui "Certbot 或其 Nginx 插件安装失败。" \
+        "Certbot or its Nginx plugin could not be installed."
     certbot renew
     command -v nginx >/dev/null 2>&1 && reload_nginx
 }
@@ -978,22 +1136,22 @@ renew_certificates() {
 show_status() {
     require_root
     if ! command -v nginx >/dev/null 2>&1; then
-        log "Nginx 尚未安装。"
+        log_ui "Nginx 尚未安装。" "Nginx is not installed."
         return 0
     fi
     nginx -v 2>&1
     nginx -t
     if command -v systemctl >/dev/null 2>&1; then
         if systemctl is-active --quiet nginx; then
-            log "Nginx 服务状态: running"
+            log_ui "Nginx 服务状态: running" "Nginx service: running"
         else
-            warn "Nginx 服务状态: stopped"
+            warn_ui "Nginx 服务状态: stopped" "Nginx service: stopped"
         fi
     fi
     if command -v certbot >/dev/null 2>&1; then
         certbot certificates || true
     else
-        warn "Certbot 尚未安装。"
+        warn_ui "Certbot 尚未安装。" "Certbot is not installed."
     fi
 }
 
@@ -1012,10 +1170,10 @@ certificate_days_left() {
 }
 
 check_certificates() {
-    [[ $# -eq 0 ]] || die "用法: ${PROGRAM} certs"
+    [[ $# -eq 0 ]] || die_ui "用法: ${PROGRAM} certs" "Usage: ${PROGRAM} certs"
     require_root
     require_command openssl
-    command -v nginx >/dev/null 2>&1 || die "Nginx 尚未安装。"
+    command -v nginx >/dev/null 2>&1 || die_ui "Nginx 尚未安装。" "Nginx is not installed."
     local dump path end_date days status found=0
     dump="$(nginx -T 2>&1 || true)"
     printf '%-7s %-8s %-24s %s\n' "STATUS" "DAYS" "EXPIRES" "CERTIFICATE"
@@ -1043,7 +1201,8 @@ check_certificates() {
             | awk '$1 == "ssl_certificate" {value=$2; sub(/;$/, "", value); if (value ~ /^\// && value !~ /\$/) print value}' \
             | sort -u
     )
-    [[ "${found}" -eq 1 ]] || log "没有发现 Nginx 正在使用的本地证书。"
+    [[ "${found}" -eq 1 ]] || log_ui "没有发现 Nginx 正在使用的本地证书。" \
+        "No local certificate referenced by Nginx was found."
 }
 
 detect_public_ipv4() {
@@ -1063,7 +1222,8 @@ detect_public_ipv4() {
 }
 
 doctor() {
-    [[ $# -le 1 ]] || die "用法: ${PROGRAM} doctor [DOMAIN]"
+    [[ $# -le 1 ]] || die_ui "用法: ${PROGRAM} doctor [DOMAIN]" \
+        "Usage: ${PROGRAM} doctor [DOMAIN]"
     local domain="${1:-}" os_id="unknown" os_version="unknown"
     local public_ip="unknown" local_ips="unknown" memory_mb="unknown" cpu_count="unknown"
     if [[ -r /etc/os-release ]]; then
@@ -1075,7 +1235,7 @@ doctor() {
     command -v hostname >/dev/null 2>&1 && local_ips="$(hostname -I 2>/dev/null | xargs || true)"
     public_ip="$(detect_public_ipv4 2>/dev/null || printf unknown)"
 
-    log "环境诊断"
+    log_ui "环境诊断" "Environment diagnostics"
     printf '  %-16s %s %s\n' "OS" "${os_id}" "${os_version}"
     printf '  %-16s %s\n' "CPU" "${cpu_count}"
     printf '  %-16s %s MB\n' "Memory" "${memory_mb}"
@@ -1100,13 +1260,13 @@ doctor() {
     fi
 
     if command -v ss >/dev/null 2>&1; then
-        log "80/443 端口监听"
+        log_ui "80/443 端口监听" "Listeners on ports 80 and 443"
         ss -ltnp 2>/dev/null | awk 'NR == 1 || $4 ~ /:80$|:443$/' || true
     fi
 
     if [[ -n "${domain}" ]]; then
-        validate_domain "${domain}" || die "域名格式不正确: ${domain}"
-        log "域名诊断: ${domain}"
+        validate_domain "${domain}" || die_ui "域名格式不正确: ${domain}" "Invalid domain: ${domain}"
+        log_ui "域名诊断: ${domain}" "Domain diagnostics: ${domain}"
         local resolved=""
         if command -v getent >/dev/null 2>&1; then
             resolved="$(getent ahostsv4 "${domain}" 2>/dev/null | awk '{print $1}' | sort -u | xargs || true)"
@@ -1159,7 +1319,8 @@ write_cloudflare_realip_config() {
 install_cloudflare_schedule() {
     local script_source script_copy cron_script
     script_source="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    [[ -f "${script_source}" ]] || die "无法定位当前脚本，不能安装自动更新任务。"
+    [[ -f "${script_source}" ]] || die_ui "无法定位当前脚本，不能安装自动更新任务。" \
+        "The current script could not be located, so the update task cannot be installed."
     script_copy="/usr/local/libexec/nginx-easy-cloudflare-realip.sh"
     cron_script="/etc/cron.weekly/nginx-easy-cloudflare-realip"
     mkdir -p /usr/local/libexec /etc/cron.weekly
@@ -1171,7 +1332,8 @@ export PATH
 exec /usr/bin/env bash ${script_copy} cf-realip
 EOF
     chmod 700 "${cron_script}"
-    log "已安装每周 Cloudflare IP 更新任务: ${cron_script}"
+    log_ui "已安装每周 Cloudflare IP 更新任务: ${cron_script}" \
+        "Installed the weekly Cloudflare IP update task: ${cron_script}"
 }
 
 cloudflare_realip() {
@@ -1180,12 +1342,13 @@ cloudflare_realip() {
         case "$1" in
             --schedule) schedule=1; shift ;;
             --remove) remove=1; shift ;;
-            *) die "未知 Cloudflare 真实 IP 选项: $1" ;;
+            *) die_ui "未知 Cloudflare 真实 IP 选项: $1" \
+                "Unknown Cloudflare real-IP option: $1" ;;
         esac
     done
 
     require_root
-    command -v nginx >/dev/null 2>&1 || die "Nginx 尚未安装。"
+    command -v nginx >/dev/null 2>&1 || die_ui "Nginx 尚未安装。" "Nginx is not installed."
     ensure_managed_config_dir
     local config="${MANAGED_CONFIG_DIR}/00-ngx-easy-cloudflare-realip.conf"
     local backup_dir timestamp backup=""
@@ -1203,10 +1366,12 @@ cloudflare_realip() {
             /usr/local/libexec/nginx-easy-cloudflare-realip.sh
         if ! nginx -t; then
             [[ -n "${backup}" ]] && cp -a "${backup}" "${config}"
-            die "删除 Cloudflare 真实 IP 配置后校验失败，已恢复。"
+            die_ui "删除 Cloudflare 真实 IP 配置后校验失败，已恢复。" \
+                "Validation failed after removing the Cloudflare real-IP config; it was restored."
         fi
         reload_nginx
-        log "已删除脚本管理的 Cloudflare 真实 IP 配置和自动任务。"
+        log_ui "已删除脚本管理的 Cloudflare 真实 IP 配置和自动任务。" \
+            "Removed the managed Cloudflare real-IP configuration and update task."
         return 0
     fi
 
@@ -1220,9 +1385,11 @@ cloudflare_realip() {
     curl -fsSL --retry 3 --connect-timeout 5 --max-time 30 \
         https://www.cloudflare.com/ips-v6/ -o "${ipv6_file}"
     validate_cloudflare_ranges "${ipv4_file}" 4 \
-        || { rm -rf "${work}"; die "Cloudflare IPv4 列表校验失败，未修改配置。"; }
+        || { rm -rf "${work}"; die_ui "Cloudflare IPv4 列表校验失败，未修改配置。" \
+            "Cloudflare IPv4 range validation failed; no configuration was changed."; }
     validate_cloudflare_ranges "${ipv6_file}" 6 \
-        || { rm -rf "${work}"; die "Cloudflare IPv6 列表校验失败，未修改配置。"; }
+        || { rm -rf "${work}"; die_ui "Cloudflare IPv6 列表校验失败，未修改配置。" \
+            "Cloudflare IPv6 range validation failed; no configuration was changed."; }
 
     temp="$(mktemp "${MANAGED_CONFIG_DIR}/.ngx-easy-cloudflare.XXXXXX")"
     write_cloudflare_realip_config "${temp}" "${ipv4_file}" "${ipv6_file}"
@@ -1235,11 +1402,13 @@ cloudflare_realip() {
             rm -f "${config}"
         fi
         rm -rf "${work}"
-        die "Cloudflare 真实 IP 配置校验失败，已恢复原配置。"
+        die_ui "Cloudflare 真实 IP 配置校验失败，已恢复原配置。" \
+            "Cloudflare real-IP configuration validation failed; the previous file was restored."
     fi
     reload_nginx
     rm -rf "${work}"
-    log "Cloudflare 真实访客 IP 配置已更新。"
+    log_ui "Cloudflare 真实访客 IP 配置已更新。" \
+        "Cloudflare real visitor IP configuration updated."
     [[ "${schedule}" -eq 1 ]] && install_cloudflare_schedule
 }
 
@@ -1259,7 +1428,9 @@ EOF
 }
 
 enable_cloudflare_dns_https() {
-    [[ $# -ge 3 ]] || die "用法: ${PROGRAM} dns-ssl DOMAIN EMAIL CREDENTIALS_FILE [--wildcard] [--staging]"
+    [[ $# -ge 3 ]] || die_ui \
+        "用法: ${PROGRAM} dns-ssl DOMAIN EMAIL CREDENTIALS_FILE [--wildcard] [--staging]" \
+        "Usage: ${PROGRAM} dns-ssl DOMAIN EMAIL CREDENTIALS_FILE [--wildcard] [--staging]"
     local domain="$1" email="$2" credentials_source="$3"
     shift 3
     local wildcard=0 staging=0
@@ -1267,16 +1438,17 @@ enable_cloudflare_dns_https() {
         case "$1" in
             --wildcard) wildcard=1; shift ;;
             --staging) staging=1; shift ;;
-            *) die "未知 DNS 证书选项: $1" ;;
+            *) die_ui "未知 DNS 证书选项: $1" "Unknown DNS certificate option: $1" ;;
         esac
     done
 
     require_root
     domain="$(printf '%s' "${domain}" | tr 'A-Z' 'a-z')"
-    validate_domain "${domain}" || die "域名格式不正确: ${domain}"
-    validate_email "${email}" || die "邮箱格式不正确: ${email}"
+    validate_domain "${domain}" || die_ui "域名格式不正确: ${domain}" "Invalid domain: ${domain}"
+    validate_email "${email}" || die_ui "邮箱格式不正确: ${email}" "Invalid email address: ${email}"
     [[ -f "${credentials_source}" && -r "${credentials_source}" ]] \
-        || die "Cloudflare 凭据文件不可读: ${credentials_source}"
+        || die_ui "Cloudflare 凭据文件不可读: ${credentials_source}" \
+            "Cloudflare credentials file is not readable: ${credentials_source}"
     local token
     token="$(awk -F= '
         /^[[:space:]]*dns_cloudflare_api_token[[:space:]]*=/ {
@@ -1284,15 +1456,18 @@ enable_cloudflare_dns_https() {
         }
     ' "${credentials_source}")"
     [[ "${token}" =~ ^[A-Za-z0-9_-]{20,}$ ]] \
-        || die "凭据文件中缺少有效的 dns_cloudflare_api_token。"
+        || die_ui "凭据文件中缺少有效的 dns_cloudflare_api_token。" \
+            "The credentials file does not contain a valid dns_cloudflare_api_token."
 
     command -v nginx >/dev/null 2>&1 || install_nginx nginx
     ensure_managed_config_dir
     local config
     config="$(site_config_path "${domain}")"
-    [[ -f "${config}" ]] || die "没有找到脚本管理的站点: ${domain}"
+    [[ -f "${config}" ]] || die_ui "没有找到脚本管理的站点: ${domain}" \
+        "No script-managed site was found for: ${domain}"
     install_cloudflare_certbot \
-        || die "Certbot Cloudflare DNS 插件安装失败，请检查系统软件源。"
+        || die_ui "Certbot Cloudflare DNS 插件安装失败，请检查系统软件源。" \
+            "The Certbot Cloudflare DNS plugin could not be installed. Check the system package repository."
 
     local credentials_dir="/etc/letsencrypt/cloudflare"
     local credentials="${credentials_dir}/${domain}.ini" temp_credentials
@@ -1325,12 +1500,17 @@ enable_cloudflare_dns_https() {
     fi
     [[ "${staging}" -eq 1 ]] && args+=(--staging)
 
-    log "正在通过 Cloudflare DNS 为 ${domain} 申请并安装证书。"
+    log_ui "正在通过 Cloudflare DNS 为 ${domain} 申请并安装证书。" \
+        "Requesting and installing a certificate for ${domain} through Cloudflare DNS."
     certbot "${args[@]}"
     reload_nginx
-    log "Cloudflare DNS 证书已启用: https://${domain}"
-    [[ "${wildcard}" -eq 1 ]] && log "证书同时包含: *.${domain}"
-    [[ "${staging}" -eq 1 ]] && warn "当前使用 Let's Encrypt 测试环境，浏览器不会信任该证书。"
+    log_ui "Cloudflare DNS 证书已启用: https://${domain}" \
+        "Cloudflare DNS certificate enabled: https://${domain}"
+    [[ "${wildcard}" -eq 1 ]] && log_ui "证书同时包含: *.${domain}" \
+        "Certificate also includes: *.${domain}"
+    [[ "${staging}" -eq 1 ]] && warn_ui \
+        "当前使用 Let's Encrypt 测试环境，浏览器不会信任该证书。" \
+        "The Let's Encrypt staging environment is active; browsers will not trust this certificate."
 }
 
 restore_tuning() {
@@ -1339,9 +1519,10 @@ restore_tuning() {
         backup_dir="$(find /var/backups/nginx-easy-deploy -maxdepth 1 -type d -name 'tuning-*' 2>/dev/null | sort | tail -n 1)"
     fi
     [[ -n "${backup_dir}" && -f "${backup_dir}/metadata.tsv" ]] \
-        || die "找不到有效的调优备份: ${backup_dir:-latest}"
+        || die_ui "找不到有效的调优备份: ${backup_dir:-latest}" \
+            "No valid tuning backup was found: ${backup_dir:-latest}"
     [[ "$(metadata_value "${backup_dir}/metadata.tsv" format_version)" == "1" ]] \
-        || die "不支持的调优备份格式。"
+        || die_ui "不支持的调优备份格式。" "Unsupported tuning backup format."
 
     local sysctl_file="/etc/sysctl.d/99-nginx-easy.conf"
     local limits_file="/etc/systemd/system/nginx.service.d/99-nginx-easy-limits.conf"
@@ -1364,7 +1545,8 @@ restore_tuning() {
     while IFS=$'\t' read -r key value; do
         case "${key}" in
             net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|net.ipv4.tcp_syncookies|fs.file-max|net.core.default_qdisc|net.ipv4.tcp_congestion_control)
-                sysctl -w "${key}=${value}" >/dev/null || warn "无法恢复内核参数: ${key}"
+                sysctl -w "${key}=${value}" >/dev/null \
+                    || warn_ui "无法恢复内核参数: ${key}" "Could not restore kernel parameter: ${key}"
                 ;;
         esac
     done < "${backup_dir}/sysctl-original.tsv"
@@ -1375,13 +1557,14 @@ restore_tuning() {
             systemctl restart nginx
         fi
     fi
-    log "已恢复调优前设置: ${backup_dir}"
+    log_ui "已恢复调优前设置: ${backup_dir}" "Restored the pre-tuning state: ${backup_dir}"
 }
 
 tune_nginx() {
     require_root
     if [[ "${1:-}" == "--restore" ]]; then
-        [[ $# -eq 2 ]] || die "用法: ${PROGRAM} tune --restore latest|BACKUP_DIR"
+        [[ $# -eq 2 ]] || die_ui "用法: ${PROGRAM} tune --restore latest|BACKUP_DIR" \
+            "Usage: ${PROGRAM} tune --restore latest|BACKUP_DIR"
         restore_tuning "$2"
         return 0
     fi
@@ -1389,7 +1572,7 @@ tune_nginx() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --bbr) enable_bbr=1; shift ;;
-            *) die "未知调优选项: $1" ;;
+            *) die_ui "未知调优选项: $1" "Unknown tuning option: $1" ;;
         esac
     done
     require_command sysctl
@@ -1454,15 +1637,18 @@ tune_nginx() {
             printf '%s\n' 'net.core.default_qdisc = fq'
             printf '%s\n' 'net.ipv4.tcp_congestion_control = bbr'
         elif [[ "${enable_bbr}" -eq 1 ]]; then
-            warn "当前内核未提供 BBR，跳过 BBR 设置。"
+            warn_ui "当前内核未提供 BBR，跳过 BBR 设置。" \
+                "The current kernel does not provide BBR; skipping BBR settings."
         fi
     } > "${temp}"
     install -m 644 "${temp}" "${sysctl_file}"
     rm -f "${temp}"
     if ! sysctl -p "${sysctl_file}"; then
-        warn "内核参数应用失败，正在恢复。"
+        warn_ui "内核参数应用失败，正在恢复。" \
+            "Applying kernel parameters failed; restoring the previous state."
         restore_tuning "${backup_dir}"
-        die "调优失败，已恢复原设置。"
+        die_ui "调优失败，已恢复原设置。" \
+            "Tuning failed and the previous settings were restored."
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
@@ -1476,27 +1662,32 @@ EOF
         if command -v nginx >/dev/null 2>&1 && systemctl cat nginx >/dev/null 2>&1; then
             nginx -t
             if ! systemctl restart nginx; then
-                warn "Nginx 重启失败，正在恢复调优前设置。"
+                warn_ui "Nginx 重启失败，正在恢复调优前设置。" \
+                    "Nginx failed to restart; restoring the pre-tuning state."
                 restore_tuning "${backup_dir}"
-                die "调优失败，已恢复原设置。"
+                die_ui "调优失败，已恢复原设置。" \
+                    "Tuning failed and the previous settings were restored."
             fi
         fi
     fi
-    log "保守调优已应用，原设置备份在: ${backup_dir}"
-    warn "脚本未修改 Swap、THP、防火墙或全局用户限制。"
+    log_ui "保守调优已应用，原设置备份在: ${backup_dir}" \
+        "Conservative tuning applied. Previous settings: ${backup_dir}"
+    warn_ui "脚本未修改 Swap、THP、防火墙或全局用户限制。" \
+        "Swap, THP, firewall and global user limits were not modified."
 }
 
 update_nginx_package() {
-    [[ $# -eq 0 ]] || die "用法: ${PROGRAM} update"
+    [[ $# -eq 0 ]] || die_ui "用法: ${PROGRAM} update" "Usage: ${PROGRAM} update"
     require_root
-    command -v nginx >/dev/null 2>&1 || die "Nginx 尚未安装。"
+    command -v nginx >/dev/null 2>&1 || die_ui "Nginx 尚未安装。" "Nginx is not installed."
     local timestamp backup
     timestamp="$(date +%Y%m%d-%H%M%S)"
     backup="/var/backups/nginx-easy-deploy/update-${timestamp}.tar.gz"
     mkdir -p "$(dirname "${backup}")"
     export_bundle --output "${backup}" --force
 
-    log "正在使用系统软件源更新 Nginx。"
+    log_ui "正在使用系统软件源更新 Nginx。" \
+        "Updating Nginx from the system package repository."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade nginx
@@ -1509,11 +1700,13 @@ update_nginx_package() {
     elif command -v zypper >/dev/null 2>&1; then
         zypper --non-interactive update nginx
     else
-        die "未找到支持的软件包管理器。"
+        die_ui "未找到支持的软件包管理器。" "No supported package manager was found."
     fi
     start_nginx
-    log "Nginx 更新完成。更新前备份: ${backup}"
-    warn "配置可从备份恢复；软件包降级需要使用发行版的软件包管理器。"
+    log_ui "Nginx 更新完成。更新前备份: ${backup}" \
+        "Nginx update completed. Pre-update backup: ${backup}"
+    warn_ui "配置可从备份恢复；软件包降级需要使用发行版的软件包管理器。" \
+        "Configuration can be restored from the archive; package downgrades require the distribution package manager."
 }
 
 remove_path_for_restore() {
@@ -1746,7 +1939,7 @@ restore_bundle() {
 
 pause_menu() {
     printf '\n'
-    read -r -p "按回车键返回菜单..." _ || true
+    read -r -p "$(ui_text "按回车键返回菜单..." "Press Enter to return to the menu...")" _ || true
 }
 
 run_menu_action() {
@@ -1759,24 +1952,25 @@ run_menu_action() {
     status=$?
     set -e
     if [[ "${status}" -ne 0 ]]; then
-        warn "操作失败，请根据上面的错误信息检查后重试。"
+        warn_ui "操作失败，请根据上面的错误信息检查后重试。" \
+            "The operation failed. Review the error above and try again."
     fi
     return 0
 }
 
 interactive_create_site() {
     local kind="$1" domain target use_ssl email=""
-    read -r -p "域名（例如 app.example.com）: " domain
+    read -r -p "$(ui_text "域名（例如 app.example.com）: " "Domain (for example app.example.com): ")" domain
     if [[ "${kind}" == "proxy" ]]; then
-        read -r -p "本机服务端口或反代地址 [3000]: " target
+        read -r -p "$(ui_text "本机服务端口或反代地址 [3000]: " "Local service port or upstream URL [3000]: ")" target
         target="${target:-3000}"
     else
-        read -r -p "静态文件目录 [/var/www/${domain}]: " target
+        read -r -p "$(ui_text "静态文件目录 [/var/www/${domain}]: " "Static files directory [/var/www/${domain}]: ")" target
         target="${target:-/var/www/${domain}}"
     fi
-    read -r -p "现在申请 HTTPS？[Y/n]: " use_ssl
+    read -r -p "$(ui_text "现在申请 HTTPS？[Y/n]: " "Request HTTPS now? [Y/n]: ")" use_ssl
     if [[ ! "${use_ssl}" =~ ^[Nn]$ ]]; then
-        read -r -p "证书通知邮箱: " email
+        read -r -p "$(ui_text "证书通知邮箱: " "Certificate notification email: ")" email
         run_menu_action create_site "${kind}" "${domain}" "${target}" --email "${email}"
     else
         run_menu_action create_site "${kind}" "${domain}" "${target}" --no-ssl
@@ -1786,11 +1980,11 @@ interactive_create_site() {
 interactive_export() {
     local output encrypt webroot
     local -a args=()
-    read -r -p "输出文件（留空自动命名）: " output
+    read -r -p "$(ui_text "输出文件（留空自动命名）: " "Output file (leave blank for an automatic name): ")" output
     [[ -n "${output}" ]] && args+=(--output "${output}")
-    read -r -p "是否用密码加密迁移包？[Y/n]: " encrypt
+    read -r -p "$(ui_text "是否用密码加密迁移包？[Y/n]: " "Encrypt the archive with a passphrase? [Y/n]: ")" encrypt
     [[ ! "${encrypt}" =~ ^[Nn]$ ]] && args+=(--encrypt)
-    read -r -p "是否同时打包静态站点目录？[y/N]: " webroot
+    read -r -p "$(ui_text "是否同时打包静态站点目录？[y/N]: " "Include static site directories? [y/N]: ")" webroot
     [[ "${webroot}" =~ ^[Yy]$ ]] && args+=(--with-webroot)
     run_menu_action export_bundle "${args[@]}"
 }
@@ -1798,12 +1992,12 @@ interactive_export() {
 interactive_delete() {
     local domain cert files answer
     local -a args=()
-    read -r -p "要删除的域名: " domain
-    read -r -p "同时删除 Certbot 证书？[y/N]: " cert
-    read -r -p "备份静态站点文件？[y/N]: " files
-    read -r -p "确认删除 ${domain}？输入 yes 继续: " answer
+    read -r -p "$(ui_text "要删除的域名: " "Domain to delete: ")" domain
+    read -r -p "$(ui_text "同时删除 Certbot 证书？[y/N]: " "Delete its Certbot certificate too? [y/N]: ")" cert
+    read -r -p "$(ui_text "备份静态站点文件？[y/N]: " "Back up static site files? [y/N]: ")" files
+    read -r -p "$(ui_text "确认删除 ${domain}？输入 yes 继续: " "Delete ${domain}? Type yes to continue: ")" answer
     if [[ "${answer}" != "yes" ]]; then
-        log "已取消。"
+        log_ui "已取消。" "Cancelled."
         return 0
     fi
     [[ "${cert}" =~ ^[Yy]$ ]] && args+=(--delete-cert)
@@ -1813,10 +2007,10 @@ interactive_delete() {
 
 interactive_custom_certificate() {
     local domain cert_file key_file chain_file
-    read -r -p "域名: " domain
-    read -r -p "证书文件路径（cert.pem 或 fullchain.pem）: " cert_file
-    read -r -p "私钥文件路径（privkey.pem/key.pem）: " key_file
-    read -r -p "单独的证书链路径（没有请留空）: " chain_file
+    read -r -p "$(ui_text "域名: " "Domain: ")" domain
+    read -r -p "$(ui_text "证书文件路径（cert.pem 或 fullchain.pem）: " "Certificate path (cert.pem or fullchain.pem): ")" cert_file
+    read -r -p "$(ui_text "私钥文件路径（privkey.pem/key.pem）: " "Private key path (privkey.pem/key.pem): ")" key_file
+    read -r -p "$(ui_text "单独的证书链路径（没有请留空）: " "Separate chain path (leave blank if none): ")" chain_file
     if [[ -n "${chain_file}" ]]; then
         run_menu_action install_custom_certificate \
             "${domain}" "${cert_file}" "${key_file}" --chain "${chain_file}"
@@ -1828,12 +2022,12 @@ interactive_custom_certificate() {
 interactive_cloudflare_dns() {
     local domain email token wildcard staging credentials
     local -a args=()
-    read -r -p "域名: " domain
-    read -r -p "证书通知邮箱: " email
-    read -r -s -p "Cloudflare API Token（输入不显示）: " token
+    read -r -p "$(ui_text "域名: " "Domain: ")" domain
+    read -r -p "$(ui_text "证书通知邮箱: " "Certificate notification email: ")" email
+    read -r -s -p "$(ui_text "Cloudflare API Token（输入不显示）: " "Cloudflare API Token (input hidden): ")" token
     printf '\n'
-    read -r -p "同时申请 *.${domain} 通配符证书？[y/N]: " wildcard
-    read -r -p "使用 Let's Encrypt 测试环境？[y/N]: " staging
+    read -r -p "$(ui_text "同时申请 *.${domain} 通配符证书？[y/N]: " "Also request a *.${domain} wildcard certificate? [y/N]: ")" wildcard
+    read -r -p "$(ui_text "使用 Let's Encrypt 测试环境？[y/N]: " "Use the Let's Encrypt staging environment? [y/N]: ")" staging
     credentials="$(mktemp /tmp/ngx-easy-cloudflare-token.XXXXXX)"
     printf 'dns_cloudflare_api_token = %s\n' "${token}" > "${credentials}"
     chmod 600 "${credentials}"
@@ -1847,7 +2041,7 @@ interactive_cloudflare_dns() {
 
 interactive_cloudflare_realip() {
     local schedule
-    read -r -p "安装每周自动更新任务？[y/N]: " schedule
+    read -r -p "$(ui_text "安装每周自动更新任务？[y/N]: " "Install a weekly automatic update task? [y/N]: ")" schedule
     if [[ "${schedule}" =~ ^[Yy]$ ]]; then
         run_menu_action cloudflare_realip --schedule
     else
@@ -1858,23 +2052,26 @@ interactive_cloudflare_realip() {
 interactive_tune() {
     local answer bbr
     local -a args=()
-    log "将设置保守连接队列、文件限制；不会修改 Swap、THP 或防火墙。"
-    read -r -p "内核支持时同时启用 BBR？[y/N]: " bbr
-    read -r -p "输入 apply 继续: " answer
-    [[ "${answer}" == "apply" ]] || { log "已取消。"; return 0; }
+    log_ui "将设置保守连接队列、文件限制；不会修改 Swap、THP 或防火墙。" \
+        "This applies conservative queue and file limits; Swap, THP and firewall settings are untouched."
+    read -r -p "$(ui_text "内核支持时同时启用 BBR？[y/N]: " "Enable BBR when supported by the kernel? [y/N]: ")" bbr
+    read -r -p "$(ui_text "输入 apply 继续: " "Type apply to continue: ")" answer
+    [[ "${answer}" == "apply" ]] || { log_ui "已取消。" "Cancelled."; return 0; }
     [[ "${bbr}" =~ ^[Yy]$ ]] && args+=(--bbr)
     run_menu_action tune_nginx "${args[@]}"
 }
 
 interactive_update() {
     local answer
-    log "更新前会自动备份 Nginx 配置和证书。"
-    read -r -p "输入 update 继续: " answer
-    [[ "${answer}" == "update" ]] || { log "已取消。"; return 0; }
+    log_ui "更新前会自动备份 Nginx 配置和证书。" \
+        "Nginx configuration and certificates will be backed up before updating."
+    read -r -p "$(ui_text "输入 update 继续: " "Type update to continue: ")" answer
+    [[ "${answer}" == "update" ]] || { log_ui "已取消。" "Cancelled."; return 0; }
     run_menu_action update_nginx_package
 }
 
 interactive_menu() {
+    select_ui_language
     require_root
     [[ -t 0 ]] || {
         usage
@@ -1884,7 +2081,35 @@ interactive_menu() {
     local choice domain email archive
     while true; do
         command -v clear >/dev/null 2>&1 && clear || true
-        cat <<'EOF'
+        if [[ "${UI_LANG}" == "en" ]]; then
+            cat <<'EOF'
+============================================================
+ nginx-easy-deploy - native Nginx deployment and migration
+ No panel and no persistent management service
+============================================================
+  1. Install or repair Nginx + Certbot
+  2. Create a reverse proxy site
+  3. Create a static website
+  4. Enable HTTPS for an existing site
+  5. Request a Cloudflare DNS or wildcard certificate
+  6. Upload and install a custom certificate
+  7. List managed sites
+  8. Diagnose the host and a domain
+  9. Check local certificate expiry
+ 10. Refresh Cloudflare real visitor IP configuration
+ 11. Delete a site with a pre-delete backup
+ 12. Renew all certificates
+ 13. Export Nginx configuration and certificates
+ 14. Restore from a migration archive
+ 15. Show service status
+ 16. Apply optional conservative system tuning
+ 17. Back up and update Nginx
+  L. Switch language / 切换语言
+  0. Exit
+------------------------------------------------------------
+EOF
+        else
+            cat <<'EOF'
 ============================================================
  nginx-easy-deploy - 原生 Nginx 一键部署与迁移
  不安装面板，不常驻额外服务
@@ -1906,25 +2131,27 @@ interactive_menu() {
  15. 查看运行状态
  16. 可选的保守系统调优
  17. 备份后更新 Nginx
+  L. 切换语言 / Switch language
   0. 退出
 ------------------------------------------------------------
 EOF
-        read -r -p "请选择 [0-17]: " choice || return 0
+        fi
+        read -r -p "$(ui_text "请选择 [0-17/L]: " "Select [0-17/L]: ")" choice || return 0
         printf '\n'
         case "${choice}" in
             1) run_menu_action install_stack ;;
             2) interactive_create_site proxy ;;
             3) interactive_create_site static ;;
             4)
-                read -r -p "域名: " domain
-                read -r -p "证书通知邮箱: " email
+                read -r -p "$(ui_text "域名: " "Domain: ")" domain
+                read -r -p "$(ui_text "证书通知邮箱: " "Certificate notification email: ")" email
                 run_menu_action enable_https_domain "${domain}" "${email}"
                 ;;
             5) interactive_cloudflare_dns ;;
             6) interactive_custom_certificate ;;
             7) run_menu_action list_sites ;;
             8)
-                read -r -p "要检查 DNS 的域名（可留空）: " domain
+                read -r -p "$(ui_text "要检查 DNS 的域名（可留空）: " "Domain to check in DNS (optional): ")" domain
                 run_menu_action doctor "${domain}"
                 ;;
             9) run_menu_action check_certificates ;;
@@ -1933,20 +2160,41 @@ EOF
             12) run_menu_action renew_certificates ;;
             13) interactive_export ;;
             14)
-                read -r -p "迁移包路径: " archive
+                read -r -p "$(ui_text "迁移包路径: " "Migration archive path: ")" archive
                 run_menu_action restore_bundle "${archive}"
                 ;;
             15) run_menu_action show_status ;;
             16) interactive_tune ;;
             17) interactive_update ;;
+            l|L)
+                select_ui_language 1
+                continue
+                ;;
             0) return 0 ;;
-            *) warn "无效选项。" ;;
+            *) warn_ui "无效选项。" "Invalid choice." ;;
         esac
         pause_menu
     done
 }
 
 main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --lang)
+                [[ $# -ge 2 ]] || die "--lang requires zh or en."
+                UI_LANG="$2"
+                normalize_ui_language
+                shift 2
+                ;;
+            --lang=*)
+                UI_LANG="${1#*=}"
+                normalize_ui_language
+                shift
+                ;;
+            *) break ;;
+        esac
+    done
+    [[ -n "${UI_LANG}" ]] && normalize_ui_language
     local command="${1:-}"
     [[ $# -gt 0 ]] && shift || true
     case "${command}" in
@@ -1960,7 +2208,8 @@ main() {
             create_site static "$@"
             ;;
         ssl|https)
-            [[ $# -ge 2 ]] || die "用法: ${PROGRAM} ssl DOMAIN EMAIL"
+            [[ $# -ge 2 ]] || die_ui "用法: ${PROGRAM} ssl DOMAIN EMAIL" \
+                "Usage: ${PROGRAM} ssl DOMAIN EMAIL"
             enable_https_domain "$1" "$2"
             ;;
         cert|certificate)

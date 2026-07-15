@@ -19,4 +19,6 @@ jobs:
       - name: Smoke-test command interface
         run: |
           bash nginx-easy-deploy.sh --help >/dev/null
-          test "$(bash nginx-easy-deploy.sh --version)" = "0.2.0"
+          bash nginx-easy-deploy.sh --lang en --help | grep -q "native Nginx deployment"
+          NGX_EASY_LANG=en bash nginx-easy-deploy.sh --help | grep -q "Common commands"
+          test "$(bash nginx-easy-deploy.sh --version)" = "0.3.0"

@@ -50,6 +50,21 @@ assert_fail safe_restore_path /
 assert_fail safe_restore_path /etc
 assert_fail safe_restore_path /etc/nginx/../../root
 
+UI_LANG="en"
+assert_equal "$(ui_text 中文 English)" "English"
+UI_LANG="zh"
+assert_equal "$(ui_text 中文 English)" "中文"
+UI_LANG="English"
+normalize_ui_language
+assert_equal "${UI_LANG}" "en"
+UI_LANG="zh_CN"
+normalize_ui_language
+assert_equal "${UI_LANG}" "zh"
+UI_LANG=""
+select_ui_language <<< "2" >/dev/null
+assert_equal "${UI_LANG}" "en"
+UI_LANG="zh"
+
 RANGE_TMP="$(mktemp -d)"
 trap 'rm -rf "${RANGE_TMP}"' EXIT
 cat > "${RANGE_TMP}/ips-v4" <<'EOF'
